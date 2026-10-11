@@ -8,10 +8,10 @@ Bitwarden/Vaultwarden vault and CalDAV/iCloud/Google/ICS calendars respectively,
 network side over WiFi so the Palm never needs its own TCP/TLS stack. It also adds a general-purpose **FTP
 Server mode** — not Palm-specific, but useful alongside the others for uploading files onto the SD card
 before a HotSync/SASD run. This document covers all of those, plus a note on SLIP Gateway reliability
-improvements. For general setup/hardware details not covered here, see the main [README.md](README.md)
-— note that MODEM mode and the built-in web config server it describes are **not present in this fork's
-actual firmware** (replaced by FTP Server mode, see below); README.md still documents them as the
-original/upstream feature set.
+improvements. For the hardware list see the main [README.md](../README.md). The original project's own
+documentation is kept as [README-Original.md](README-Original.md) — note that the MODEM mode, AT
+commands and built-in web config server it describes are **not present in this firmware** (see "What
+changed" below).
 
 ## What changed from the original WiRSa
 
@@ -26,15 +26,16 @@ original/upstream feature set.
   serial only.
 - **Serial Config (data bits/parity/stop bits) is no longer a menu setting** — locked to 8-N-1. Baud
   Rate is still user-selectable as before.
-- **RTS/CTS hardware flow control and DTR are no longer supported** — confirmed not wired on this
-  hardware, so the pins/settings for them were removed. DCD/DSR/RI are untouched.
+- **No modem control lines are used.** RTS/CTS hardware flow control and DTR were removed (not wired
+  on this hardware), and with MODEM mode gone nothing drives DCD, DSR or RI either. Only the serial
+  data lines are used.
 - **WiRSa now manages WiFi in the background** — see "Background WiFi & the status icon" below.
 - **Utilities has been trimmed down**: Auto-Detect Baud, Hex Dump Mode, and Loopback Test are no
-  longer menu items (their AT commands still work — see WiRSa's own AT command reference), and Signal
+  longer menu items (and with MODEM mode gone there are no AT commands for them either), and Signal
   Monitor is gone entirely. A new **Retry WiFi** item was added, and **Information** was redesigned to
-  scroll instead of a small popup that used to cut text off. See below.
-- Telnet Server and Config are otherwise unchanged; SLIP Gateway has been made substantially more
-  reliable and now starts immediately instead of opening a submenu first (see below).
+  scroll instead of a small popup that used to cut text off. Utilities is now just those two items.
+- Config is otherwise unchanged; SLIP Gateway has been made substantially more reliable and now
+  starts immediately instead of opening a submenu first (see below).
 
 ---
 
@@ -46,12 +47,14 @@ time — no mode has to bring WiFi up itself anymore before it can be used.
 - Every screen's title bar now shows a small 3-bar signal-strength icon (top-right, next to the baud
   rate): solid bars while connected, animated/climbing bars while trying to connect, and a static
   X once it gives up.
-- WiRSa retries connecting for about a minute. If it still can't connect after that, it stops trying
-  and shows the X — this matches what real hardware actually does (WiFi tends to stop responding to
+- WiRSa retries connecting for about a minute and a half. If it still can't connect after that, it
+  stops trying and shows the X — this matches what real hardware actually does (WiFi tends to stop responding to
   repeated connection attempts after about that long anyway), rather than spinning forever with no
   visible outcome.
-- To try again, go to **Utilities → Retry WiFi**.
-- Any mode that needs WiFi (FTP Server, SLIP Gateway) will automatically show **"Waiting for
+- To try again, go to **Utilities → Retry WiFi**. **Utilities → Information** shows the network name,
+  signal strength and WiRSa's IP address once connected.
+- Any mode that needs WiFi (FTP Server, SLIP Gateway, BitWarden Relay, CalDAV Relay) will
+  automatically show **"Waiting for
   WiFi..."** and try connecting itself if it isn't already connected when you enter it. If that also
   times out, you'll see **"WiFi unavailable. Retry?"** — press the center/select button to try again,
   or Back to cancel and return to the previous menu.
@@ -156,7 +159,7 @@ won't get installed by mistake.
 
 ### What the screen shows
 
-- **Title bar**: `HotSync` with the current live baud rate in the top-right corner.
+- **Title bar**: `HotSync` with the current live baud rate and WiFi status in the top-right corner.
 - **`State:`**: `Waiting` / `Connected` / `Syncing` / `Completed` / `Init Complete`.
   - `Init Complete` specifically means the `SASD` folder's own initial-driver-install path triggered
     this run (see the folder layout section above) — otherwise it just says `Completed`.
@@ -175,7 +178,7 @@ won't get installed by mistake.
 ## BitWarden Relay mode
 
 Lets the dedicated **BitWarden** Palm app sync a Bitwarden or self-hosted Vaultwarden vault. WiRSa does
-the WiFi/TLS/HTTP work and PBKDF2/Argon2id key derivation; the Palm only ever speaks a simple framed
+the WiFi/TLS/HTTP work and the PBKDF2 key derivation; the Palm only ever speaks a simple framed
 protocol over serial and never opens a network connection itself.
 
 ### Requirements
@@ -183,22 +186,26 @@ protocol over serial and never opens a network connection itself.
 - WiFi configured and reachable.
 - A Bitwarden/Vaultwarden server reachable from WiRSa's network.
 - The BitWarden Palm app installed, with server URL and email set in its own Preferences.
+- The account's key derivation set to **PBKDF2** (Bitwarden's default). Accounts switched to
+  **Argon2id are not supported yet** — the sync is refused with a message saying so.
 
 ### Using it
 
-1. From WiRSa's main menu, select **`BitWarden Relay`**. The screen shows `Waiting...` — WiRSa is now
-   listening for the Palm app.
+1. From WiRSa's main menu, select **`BitWarden Relay`**. The screen shows `Preparing...` briefly the
+   first time after a boot, then `Waiting...` — WiRSa is now listening for the Palm app.
 2. On the Palm, open BitWarden and tap **Sync Now**. The Palm prompts for the master password if none
    is cached.
-3. Watch the status progress: `Connecting...` → `Negotiating rate...` → `Negotiated NNNNN baud` →
-   `Syncing...` (this step can take a while — key derivation alone can run 1-3+ minutes depending on the
-   vault's configured iteration count) → `Completed!` → back to `Waiting...`.
+3. The **Palm** shows the progress: `Connecting...` → `Negotiating rate...` → `Negotiated NNNNN baud`
+   → `Syncing...` with a running item count. **WiRSa** shows `Syncing...` while it is working (this
+   step can take a while — key derivation alone can run 1-3+ minutes depending on the vault's
+   configured iteration count), then returns to `Waiting...`.
 4. Press **Back** (or send `+++` over the USB serial console) to exit and return to the main menu.
 
 ### What it shows
 
 - **Title bar**: `Bitwarden` with the current live baud rate and WiFi status in the top-right corner.
-- **Status line**: the phase progression above, or an error if something fails.
+- **Status line**: `Preparing...`, `Waiting...` or `Syncing...`. Progress detail and any error
+  message appear on the Palm, not here.
 
 ### Notes
 
@@ -320,12 +327,14 @@ real secret) or in your own `google_auth.py` copy — nothing is ever stored on 
 2. **Per calendar slot, on the Palm**: in CalDAV Sync, set a slot's type to Google, enter the **Calendar
    ID** (`primary` for your main calendar, or a specific calendar's ID from Google Calendar's own
    settings), the **Client ID**, and the **Client Secret** from step 1 (tap any of the three fields to
-   open the full-screen text editor — all can be long strings). Also paste that same Client ID and Client
-   Secret into `apps/caldav_sync/tools/google_auth.py`'s `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`
-   constants, once, on your computer.
+   open the full-screen text editor — all can be long strings; the Client Secret field is labelled
+   **Secret**). Also paste that same Client ID and Client Secret into the `GOOGLE_CLIENT_ID`/
+   `GOOGLE_CLIENT_SECRET` constants of `google_auth.py`, once, on your computer. That script ships
+   with the CalDAV Sync Palm app's sources (`apps/caldav_sync/tools/` in the Palm apps repository),
+   not with this firmware.
 3. Tap **Sign in with Google**. The Palm shows WiRSa's IP address and a 6-digit PIN, and the exact
    command to run. On a computer with Python 3 and a browser, run
-   `python3 google_auth.py --ip <ip> --pin <pin>` from `apps/caldav_sync/tools/` — it opens your browser
+   `python3 google_auth.py --ip <ip> --pin <pin>` from that `tools/` folder — it opens your browser
    for Google sign-in, then sends the resulting refresh token to WiRSa, which relays it straight to the
    Palm over serial and discards its own copy immediately. The PIN and listener are single-use and expire
    after 5 minutes.
@@ -335,17 +344,21 @@ real secret) or in your own `google_auth.py` copy — nothing is ever stored on 
 
 ### Using it
 
-1. From WiRSa's main menu, select **`CalDAV Relay`**. The screen shows `Waiting...`.
+1. From WiRSa's main menu, select **`C[A]lDAV Relay`** (the brackets mark its serial shortcut key).
+   The screen shows `Preparing...` briefly the first time after a boot, then `Waiting...`.
 2. On the Palm, open CalDAV Sync and tap **Sync** (one calendar) or use **Record → Sync All** (every
    configured, non-skipped slot in one run).
-3. Watch the status progress the same way as BitWarden Relay: `Connecting...` → `Negotiating rate...` →
-   `Negotiated NNNNN baud` → `Syncing...` → `Completed!` → `Waiting...`.
+3. The **Palm** shows the progress the same way as BitWarden: `Connecting...` → `Negotiating rate...`
+   → `Negotiated NNNNN baud` → syncing. **WiRSa** shows `Connecting...` → `Syncing...` →
+   `Completed!` for each calendar, then returns to `Waiting...`.
 4. Press **Back** (or `+++`) to exit and return to the main menu.
 
 ### What it shows
 
 - **Title bar**: `CalDAV` with the current live baud rate and WiFi status in the top-right corner.
-- **Status line**: the phase progression above, or an error if something fails.
+- **Status line**: `Preparing...`, `Waiting...`, `Connecting...`, `Syncing...`, `Completed!`, or
+  `Google sign-in...` while a Google sign-in is waiting for the computer. Error messages appear on
+  the Palm, not here.
 
 ### Notes
 
@@ -381,8 +394,10 @@ device without a cable swap. Replaces MODEM mode's old menu slot.
    status icon" above) or **Start (AP Mode)** (WiRSa broadcasts its own WiFi network — useful with no
    existing WiFi available, e.g. in the field). **Status** shows whether the server is currently
    running.
-3. Connect with any FTP client to WiRSa's IP address (shown on WiRSa's own WiFi/AP screens) — browse,
-   upload, download, delete, same as any FTP server. It keeps running in the background regardless of
+3. Connect with any FTP client to WiRSa's IP address — browse, upload, download, delete, same as any
+   FTP server. On your own WiFi network the address is listed under **Utilities → Information**; in AP
+   mode it is the access point's own address (192.168.4.1 unless your ESP32 core differs). An AP
+   password shorter than 8 characters starts an **open** network, with a warning on screen. It keeps running in the background regardless of
    which other menu you're in.
 4. **Stop** from the same menu when done.
 
@@ -391,9 +406,10 @@ device without a cable swap. Replaces MODEM mode's old menu slot.
 - **Cannot run at the same time as SASD SDCard mode** (the two touch the SD card in incompatible ways)
   — whichever is active blocks the other from starting, with a clear on-screen message. Stop one to
   start the other.
-- **Runs fine at the same time as HotSync mode** — HotSync only ever reads the SD card, so there's no
-  conflict; upload a file via FTP, then immediately HotSync it onto the Palm without stopping the FTP
-  server first.
+- **Can stay running during HotSync mode** — nothing blocks the two from being active together, so
+  you can upload a file via FTP and then HotSync it onto the Palm without stopping the FTP server
+  first. HotSync does write to the card (it moves each installed file from `INSTALL` to `INSTALLED`),
+  so don't upload into `INSTALL` while a sync is actually in progress.
 
 ---
 
@@ -425,9 +441,9 @@ Palm, these fixes directly address that.
 ## Credits & references
 
 - **This project** is a fork of [nullvalue0/WiRSa](https://github.com/nullvalue0/WiRSa) — see the main
-  [README.md](README.md) for hardware details and the original upstream feature set (note: this fork's
-  actual firmware no longer includes MODEM mode/AT commands or the web config server it describes —
-  see "What changed" above).
+  [README.md](../README.md) for hardware details, and [README-Original.md](README-Original.md) for the
+  original upstream feature set (note: this firmware no longer includes the MODEM mode, AT commands
+  or web config server described there — see "What changed" above).
 - **FTP Server mode** is built on the vendored
   [MultiFTPServer](https://github.com/renzo-mischianti/MultiFTPServer) library.
 - **CalDAV Relay mode** uses the vendored [uICAL](https://github.com/sourcesimian/uICAL) library for
