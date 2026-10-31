@@ -1,25 +1,8 @@
-// HotSync Install Module
-//
-// Wire-compatible (not code-ported) reimplementation of dmitry.gr's SASD
-// project's own embedded HotSync host client, for the ESP32/Arduino target.
-// Reference source: ~/Downloads/sasdSource/SASD_release/software/serialSD/
-// firmware/ - slk.c (SLP framing + CRC-16/XMODEM), frag.c (PADP-style
-// fragmentation - this port needs the REAL multi-fragment version, unlike
-// sasd.cpp's simplified single-fragment reimplementation, since resource/
-// record payloads routinely exceed one 524-byte fragment), hotsync.c (the
-// DLP opcode layer), prc.c (PRC file parsing - extended here to also read
-// PDB files, which the reference deliberately does not support).
-//
-// WiRSa plays the desktop-cradle role: waits for a Palm's HotSync WAKE
-// packet, negotiates a session, then pushes every .PRC/.PDB file found in
-// two SD-card folders onto the device, then ends the sync. Full design/
-// rationale in ~/WiRSa/HOTSYNC_PLAN.md.
-//
-// Unlike the C reference (which casts wire bytes onto __attribute__((packed))
-// structs), every multi-byte field here is serialized/parsed by hand via the
-// hsPut*/hsGet* helpers below - avoids all alignment/struct-packing risk on
-// this target, matching the byte-array idiom sasd.cpp already established in
-// this codebase.
+// HotSync Install: WiRSa plays the desktop cradle. It waits for a Palm's HotSync WAKE, negotiates a session, installs every .PRC/.PDB in two folders of the
+// selected disk (SD card or virtual card, per the Disk setting) and ends the sync. Design: apps/WiRSa-Palm.md.
+// Wire-compatible with dmitry.gr's SASD host client (slk.c SLP framing and CRC-16/XMODEM, frag.c fragmentation, hotsync.c DLP layer, prc.c); not a code port.
+// Unlike sasd.cpp this needs the real multi-fragment PADP, since resource and record payloads exceed one 524-byte fragment, and it reads PDB files too.
+// Multi-byte fields are built and parsed by hand (hsPut*/hsGet*) rather than cast onto packed structs, to avoid alignment risk.
 
 #include "Arduino.h"
 #include "hotsync.h"
@@ -27,13 +10,23 @@
 #include "serial_io.h"
 #include "display_menu.h"
 #include "network.h"         // drawWifiStatusIcon() - hsDrawHeader() paints it too
+#include "palm_ctl.h"
+#include "mode_timer.h"
+#include "settings.h"   // modeAfterExitSec
+#include "relay_proto.h"   // CTL_LEAD
 #include <SD.h>
+#include "sd_activity.h"
+#include "sd_mount.h"
+#include "vdisk.h"
+#include "vdfs.h"
 
-// ============================================================================
-// Protocol constants
-// ============================================================================
+// The disk HotSync installs from (the Disk setting, settings.h), chosen by hotsyncPrepareDisk() at mode start.
+static fs::FS *hsFs = &SD;
+static bool hsVirtual = false;
 
-// ---- slk.c layer -------------------------------------------------------
+// ---- Protocol constants ----
+
+// ---- slk.c layer ----
 #define SLK_MAGIC0        0xBE
 #define SLK_MAGIC1        0xEF
 #define SLK_MAGIC2        0xED
@@ -42,7 +35,7 @@
 #define PKT_TYP_HOTSYNC   2
 #define PKT_TYP_LOOPBACK  3
 
-// ---- frag.c layer -------------------------------------------------------
+// ---- frag.c layer ----
 #define FRAG_HDR_LEN      4    // typ + flags + ofst[2]
 #define FRAG_TYP_DATA     1
 #define FRAG_TYP_ACK      2
@@ -50,26 +43,16 @@
 #define FRAG_FLAG_LAST    0x40
 #define FRAG_FLAG_OOM     0x20
 #define FRAG_MAX_CHUNK_SZ 524
-// The SASD reference used ~150ms/4 retries, tuned for its own bare-metal
-// target. Real desktop tooling is far more patient - pilot-link's own PADP
-// layer (libpisock/padp.c) uses PI_PADP_TX_TIMEOUT=2000ms x
-// PI_PADP_TX_RETRIES=10 per packet. A first real-hardware HotSync attempt
-// against this file's original 200ms x 4 (800ms total) budget failed with
-// "handshake failed" and no other diagnostic - widened to something much
-// closer to pilot-link's own proven numbers, since an under-patient sender
-// silently timing out looks identical to a real protocol failure with no
-// way to tell them apart from the log alone.
+// Resend budget: the SASD reference used ~150 ms x 4, which failed the first real HotSync ("handshake failed" and nothing else). pilot-link's PADP uses 2000 ms x 10 per packet;
+// this is in that range, because an impatient sender looks the same as a protocol failure in the log.
 #define FRAG_MAX_RESENDS  8
 #define FRAG_ACK_WAIT_MS  1000
 
-// Largest single slk payload we ever need to hold at once: FragHdr(4) + one
-// chunk of resource/record data (524) = 528 max for streaming sends (never
-// buffered whole - see hsFragSendContinue). For non-streaming request/
-// response envelopes (well under 128 bytes each) a smaller scratch buffer
-// is used - HS_RXBUF_SIZE below.
+// Largest slk payload held at once: FragHdr 4 + one 524-byte data chunk (streaming sends are never buffered whole, see hsFragSendContinue). Request/response envelopes
+// are far smaller (HS_RXBUF_SIZE).
 #define HS_RXBUF_SIZE     256
 
-// ---- DLP high-level opcodes (hotsync.c) ---------------------------------
+// ---- DLP opcodes (hotsync.c) ----
 #define HS_PKT_REPLY_MASK      0x80
 #define HS_PKT_WAKE            0x01
 #define HS_PKT_INIT            0x02
@@ -97,7 +80,7 @@
 #define HS_END_CAUSE_NORMAL 0
 #define HS_END_CAUSE_OTHER  3
 
-// ---- PRC/PDB header layout ----------------------------------------------
+// ---- PRC/PDB header layout ----
 #define PALM_DB_HDR_LEN            0x4E    // fixed header size before the entry list
 #define PALM_DB_ATTR_RESOURCE      0x0001  // set => PRC (resource DB), clear => PDB (record DB)
 #define PALM_DB_ATTR_RESET         0x0020  // "reset after install" - see hsInstallFile's own comment for when this is actually forced
@@ -105,12 +88,7 @@
 #define PALM_DB_REC_ENTRY_LEN      8       // ofst(4) + attrs(1) + uniqueID(3)
 #define PALM_DB_MAX_ENTRIES        512     // generous vs. the LPC802 reference's MAX_RESOURCES=32 - ESP32 has ample RAM
 
-// ============================================================================
-// Byte serialization helpers - big-endian (network byte order), matching the
-// real Palm HotSync wire protocol (confirmed against both the reference's
-// own SASD_LITTLE_ENDIAN+TO_U16 byteswap build flag and pilot-link's slp.c
-// get_short()/crc16() usage).
-// ============================================================================
+// ---- Big-endian byte helpers (the HotSync wire order, as in pilot-link's slp.c) ----
 
 static uint16_t hsPut8(uint8_t *buf, uint16_t pos, uint8_t v) {
   buf[pos] = v;
@@ -140,9 +118,7 @@ static uint32_t hsGet32(const uint8_t *buf, uint16_t pos) {
          ((uint32_t) buf[pos + 2] << 8) | (uint32_t) buf[pos + 3];
 }
 
-// ============================================================================
-// State
-// ============================================================================
+// ---- State ----
 
 enum HsModeState { HS_WAITING, HS_DONE };
 static HsModeState hsState = HS_WAITING;
@@ -152,20 +128,17 @@ static uint8_t  hsTxTid = 0;
 static uint8_t  hsRxBuf[HS_RXBUF_SIZE];
 static char     hsCurFileName[40];
 
-// OLED status area state - see hsDrawStatus()'s own comment for the layout.
+// OLED status area state, see hsDrawStatus().
 static char hsStateLine[16] = "Waiting";
 static char hsLogLine1[22] = "";
 static char hsLogLine2[22] = "";
 
-// True if this session's SASD-folder install actually installed at least
-// one PRC (not just found-and-skipped-as-already-existing) - set inside
-// hsInstallWalk(), read at session end to pick "Init Complete" over the
-// plain "Completed" state label.
+// True if this session's SASD-folder install put in at least one PRC (not only skipped existing ones); picks "Init Complete" over "Completed" at the end.
 static bool hsSasdInitTriggered = false;
 
 extern bool usbDebug;
 
-// ---- forward decls (static helpers) ----------------------------------------
+// ---- forward declarations ----
 static void hsDrawHeader();
 static void hsDrawStatus();
 static void hsSetState(const char *state);
@@ -218,15 +191,14 @@ static void hsInstallWalk(bool *anyFailOut);
 static bool hsFolderExists(const char *path);
 static bool hsInstallExt(const char *path, const char *ext, bool deleteFirst, bool forceReset,
                           uint16_t *installedCountOut, const char *moveToDir);
+static uint32_t hsInstalledCount = 0, hsSkippedCount = 0;   // this session, for the summary line
+static unsigned long hsSessionStartMs = 0;
+
 static bool hsInstallFile(File &f, bool deleteFirst, bool forceReset, bool *wasInstalledOut);
 
 static HsFragSendState gStreamSt;   // reused for whichever Write*Begin/Continue is active
 
-// ============================================================================
-// OLED header - live baud (not the configured showHeader() value - see
-// HOTSYNC_PLAN.md round 4) top-right, same boxed-header chrome as sasd.cpp's
-// sasdDrawStatusLines()/slip_mode.cpp's slipShowStatus().
-// ============================================================================
+// ---- OLED header: the live baud top right, in the chrome of sasdDrawStatusLines() and slipShowStatus() ----
 
 static void hsDrawHeader() {
   display.fillRect(0, 0, 128, 16, SSD1306_WHITE);
@@ -248,19 +220,9 @@ static void hsDrawHeader() {
   drawWifiStatusIcon();  // WiFi status on every title bar
 }
 
-// ============================================================================
-// OLED status area - plain lines against the black background under the
-// title, not the SASD-style white busy-dialog box (showMessage()) - that
-// box wastes most of the screen on chrome/padding for what's really just a
-// few lines of text. Layout, all left-aligned starting at x=0:
-//   y=19  "State: <Waiting|Connected|Syncing|Completed>"
-//   y=29  "Details:" (static label)
-//   y=39  scrolling detail log line 1 (older)
-//   y=49  scrolling detail log line 2 (newer)
-// hsLog() shifts line2 into line1 and puts the new entry in line2, so the
-// two visible lines scroll up as new detail events come in - callers only
-// ever see the latest 2, matching "up to 2 lines...scrolling up" exactly.
-// ============================================================================
+// ---- OLED status area: plain lines under the title (a white dialog box wastes most of the screen) ----
+// y=19 "State: <Waiting|Connected|Syncing|Completed>", y=29 "Details:", y=39 and y=49 the two newest detail lines.
+// hsLog() shifts line 2 into line 1 and puts the new entry in line 2.
 
 static void hsDrawStatus() {
   display.fillRect(0, 17, 128, 47, SSD1306_BLACK);
@@ -295,11 +257,9 @@ static void hsLog(const char *line) {
   hsDrawStatus();
 }
 
-// ============================================================================
-// slk.c layer - single SLP packet send/receive
-// ============================================================================
+// ---- slk.c layer: one SLP packet ----
 
-// Reads one byte with an absolute-deadline timeout. Returns false on timeout.
+// Reads one byte before an absolute deadline; false on timeout.
 static bool hsReadByte(uint8_t *out, unsigned long deadlineMs) {
   while (!PhysicalSerial.available()) {
     if ((long) (millis() - deadlineMs) >= 0) return false;
@@ -313,7 +273,7 @@ static uint8_t hsSum9(const uint8_t *hdr9) {
   return s;
 }
 
-// Sends one complete slk packet: 10-byte header + payload + 2-byte CRC.
+// Sends one slk packet: 10-byte header, payload, 2-byte CRC.
 static void hsSlkSend(uint8_t dst, uint8_t src, uint8_t pktTyp, uint8_t tid,
                        const uint8_t *payload, uint16_t len) {
   uint8_t hdr[SLK_HDR_LEN];
@@ -336,28 +296,21 @@ static void hsSlkSend(uint8_t dst, uint8_t src, uint8_t pktTyp, uint8_t tid,
   PhysicalSerial.write(crcOut, 2);
 }
 
-// Receives ONE full slk packet (header+payload+CRC-verified) within an
-// absolute deadline. On a header-checksum mismatch or CRC mismatch, keeps
-// scanning for the next valid packet rather than failing outright, matching
-// slk.c's own do-while retry-on-corruption loop - still bounded by the same
-// overall deadline. Returns false only on timeout.
+// Receives one slk packet (header and CRC verified) before an absolute deadline. A bad header checksum or CRC keeps scanning for the next valid packet, as slk.c does.
+// False only on timeout.
 static bool hsSlkRecvOne(uint8_t *outDst, uint8_t *outSrc, uint8_t *outTyp, uint8_t *outTid,
                           uint8_t *payload, uint16_t payloadCap, uint16_t *payloadLenOut,
                           unsigned long deadlineMs) {
   uint8_t window[SLK_HDR_LEN] = {0};
-  // Tracks whether ANY byte at all arrived before the deadline - lets a
-  // timeout log distinguish "the other end sent nothing" from "something
-  // arrived but never formed a valid header", which look identical without
-  // this (both just return false) but mean very different things when
-  // diagnosing a stuck handshake.
+  // Whether any byte arrived at all, so a timeout log can tell "nothing sent" from "something arrived but never formed a header".
   uint32_t bytesSeen = 0;
 
   for (;;) {
-    // slide the header window one byte at a time until magic+checksum lock
+    // slide the header window a byte at a time until magic and checksum lock
     for (;;) {
       uint8_t b;
       if (!hsReadByte(&b, deadlineMs)) {
-        if (usbDebug) Serial.printf("HotSync: SLP recv timeout (%lu byte(s) seen, no valid header)\r\n", (unsigned long) bytesSeen);
+        LOGV("HotSync: SLP recv timeout (%lu byte(s) seen, no valid header)\r\n", (unsigned long) bytesSeen);
         return false;
       }
       bytesSeen++;
@@ -371,23 +324,21 @@ static bool hsSlkRecvOne(uint8_t *outDst, uint8_t *outSrc, uint8_t *outTyp, uint
 
     uint16_t dataLen = hsGet16(window, 6);
     if (dataLen > payloadCap) {
-      // Can't be a real packet at this length (or link corruption) - keep
-      // scanning rather than trust it; don't reset the window, it'll flush
-      // out naturally as new bytes shift through.
+      // Not a real packet at this length (or corruption): keep scanning; the window flushes out as new bytes shift in.
       continue;
     }
 
     uint16_t got = 0;
     while (got < dataLen) {
       if (!hsReadByte(&payload[got], deadlineMs)) {
-        if (usbDebug) Serial.printf("HotSync: SLP recv timeout mid-payload (%u/%u bytes, header locked)\r\n", (unsigned) got, (unsigned) dataLen);
+        LOGV("HotSync: SLP recv timeout mid-payload (%u/%u bytes, header locked)\r\n", (unsigned) got, (unsigned) dataLen);
         return false;
       }
       got++;
     }
     uint8_t crcBuf[2];
     if (!hsReadByte(&crcBuf[0], deadlineMs) || !hsReadByte(&crcBuf[1], deadlineMs)) {
-      if (usbDebug) Serial.println("HotSync: SLP recv timeout mid-CRC (header+payload complete)");
+      LOGV("HotSync: SLP recv timeout mid-CRC (header+payload complete)");
       return false;
     }
 
@@ -397,7 +348,7 @@ static bool hsSlkRecvOne(uint8_t *outDst, uint8_t *outSrc, uint8_t *outTyp, uint
     for (uint16_t i = 0; i < dataLen; i++) crcCalc = zmCRC16Update(crcCalc, payload[i]);
 
     if (crcRxed != crcCalc) {
-      if (usbDebug) Serial.printf("HotSync: SLP CRC mismatch (got %04X, exp %04X) - dropped\r\n", crcRxed, crcCalc);
+      LOGW("HotSync: SLP CRC mismatch (got %04X, exp %04X) - dropped\r\n", crcRxed, crcCalc);
       continue;   // corrupted packet - resync and keep waiting for a good one
     }
 
@@ -416,11 +367,9 @@ static uint8_t hsNextTid() {
   return hsTxTid;
 }
 
-// ============================================================================
-// frag.c layer - real multi-fragment PADP-style reliability wrapper
-// ============================================================================
+// ---- frag.c layer: multi-fragment PADP-style reliability ----
 
-// Sends one fragment and waits (with resend) for its matching ACK.
+// Sends one fragment and waits (resending) for its ACK.
 static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
                              uint8_t flags, uint16_t ofstField,
                              const uint8_t *data, uint16_t len) {
@@ -432,8 +381,8 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
   pos = hsPutBytes(out, pos, data, len);
 
   for (uint8_t attempt = 0; attempt < FRAG_MAX_RESENDS; attempt++) {
-    if (attempt > 0 && usbDebug) {
-      Serial.printf("HotSync: resend attempt %u/%u (tid=%u flags=0x%02x ofst=%u len=%u)\r\n",
+    if (attempt > 0 && logOn(LOG_VERBOSE)) {
+      logPrintf(LOG_VERBOSE, "HotSync: resend attempt %u/%u (tid=%u flags=0x%02x ofst=%u len=%u)\r\n",
                      (unsigned) attempt + 1, (unsigned) FRAG_MAX_RESENDS, tid, flags, ofstField, len);
     }
     hsSlkSend(dstSlk, srcSlk, PKT_TYP_HOTSYNC, tid, out, pos);
@@ -441,11 +390,7 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
     unsigned long deadline = millis() + FRAG_ACK_WAIT_MS;
     for (;;) {
       uint8_t gDst, gSrc, gTyp, gTid;
-      // A Palm's own ACK packets carry 2 extra bytes of payload beyond the
-      // bare 4-byte FragHdr (a known PalmOS quirk, also flagged in the SASD
-      // reference's frag.c). Sized generously here and only the first 4
-      // bytes (typ/flags/ofst) are actually inspected below - any trailing
-      // bytes, garbage or otherwise, are simply ignored.
+      // A Palm's ACK carries 2 bytes beyond the 4-byte FragHdr (a known PalmOS quirk); only the first 4 are read.
       uint8_t rxBuf[16];
       uint16_t rxLen;
       if (!hsSlkRecvOne(&gDst, &gSrc, &gTyp, &gTid, rxBuf, sizeof(rxBuf), &rxLen, deadline))
@@ -456,14 +401,10 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
       uint8_t gFragFlags = rxBuf[1];
       uint16_t gFragOfst = hsGet16(rxBuf, 2);
 
-      // Must be addressed back to us, same pktTyp/tid, an ACK. Does not
-      // require the echoed ofst/size field to match what we sent - matches
-      // pilot-link's own desktop-side implementation (padp_tx(),
-      // libpisock/padp.c), which matches an ack by (type==ACK, txid==ours)
-      // only, never by the size field.
+      // It must be addressed to us, same pktTyp and tid, an ACK. The echoed ofst/size is not compared, as in pilot-link's padp_tx(), which matches on (ACK, txid) only.
       if (gDst != srcSlk || gSrc != dstSlk || gTyp != PKT_TYP_HOTSYNC || gTid != tid) {
-        if (usbDebug && (gTyp == PKT_TYP_HOTSYNC)) {
-          Serial.printf("HotSync: ignoring unrelated pkt dst=%u src=%u tid=%u (want tid=%u)\r\n",
+        if (logOn(LOG_VERBOSE) && (gTyp == PKT_TYP_HOTSYNC)) {
+          logPrintf(LOG_VERBOSE, "HotSync: ignoring unrelated pkt dst=%u src=%u tid=%u (want tid=%u)\r\n",
                          gDst, gSrc, gTid, tid);
         }
         continue;
@@ -471,14 +412,14 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
       if (gFragTyp != FRAG_TYP_ACK) continue;
 
       if (gFragFlags & FRAG_FLAG_OOM) {
-        if (usbDebug) Serial.println("HotSync: device reported OOM, aborting send");
+        LOGW("HotSync: device reported OOM, aborting send");
         return false;   // device out of memory - no point retrying
       }
       return true;
     }
   }
-  if (usbDebug) {
-    Serial.printf("HotSync: no ack after %u attempts (tid=%u flags=0x%02x ofst=%u len=%u) - giving up\r\n",
+  if (logOn(LOG_VERBOSE)) {
+    logPrintf(LOG_VERBOSE, "HotSync: no ack after %u attempts (tid=%u flags=0x%02x ofst=%u len=%u) - giving up\r\n",
                    (unsigned) FRAG_MAX_RESENDS, tid, flags, ofstField, len);
   }
   return false;
@@ -491,11 +432,8 @@ static bool hsFragSendStart(HsFragSendState *st, uint8_t tid, uint16_t totalLen)
   return true;
 }
 
-// May be called repeatedly with arbitrary-sized increments (e.g. a small SD
-// read-buffer at a time) - the FRAG_MAX_CHUNK_SZ chunk boundary and FIRST/
-// LAST flags are computed purely from st->curPos/st->totalLen, independent
-// of how much data the caller hands over per call. This is what lets a large
-// PRC resource stream straight from SD without ever being buffered whole.
+// May be called with any size increment (e.g. one SD read buffer): chunk boundaries and FIRST/LAST flags come from st->curPos and st->totalLen alone, so a large PRC
+// resource streams from the card without being buffered whole.
 static bool hsFragSendContinue(HsFragSendState *st, const uint8_t *data, uint16_t len) {
   if (!len) return true;
   if ((uint32_t) st->totalLen - st->curPos < len) return false;   // caller bug - overrun
@@ -525,19 +463,14 @@ static bool hsFragSendContinue(HsFragSendState *st, const uint8_t *data, uint16_
   return true;
 }
 
-// One-shot convenience: send data (<= FRAG_MAX_CHUNK_SZ, true for every
-// non-streaming request in this file) as a single FIRST|LAST fragment.
+// One-shot: sends data (<= FRAG_MAX_CHUNK_SZ, true of every non-streaming request here) as a single FIRST|LAST fragment.
 static bool hsFragSendOne(uint8_t tid, const uint8_t *data, uint16_t len) {
   HsFragSendState st;
   return hsFragSendStart(&st, tid, len) && hsFragSendContinue(&st, data, len);
 }
 
-// Receives one (possibly multi-fragment) message addressed to us, auto-
-// acking each fragment as it arrives. Loosely matches slk address+type only
-// (NOT tid against any prior request) - matching the reference's own
-// hotsyncPrvRx, since this protocol is strictly sequential (never
-// pipelined), so "the next well-formed message addressed to us" IS the
-// reply we're waiting for. Returns false on timeout or a malformed stream.
+// Receives one (possibly multi-fragment) message addressed to us, acking each fragment. Matches the slk address and type only, not the tid: the protocol is strictly
+// sequential, so the next well-formed message to us is the reply (as the reference's hotsyncPrvRx). False on timeout or a malformed stream.
 static bool hsFragRecv(uint8_t *dst, uint16_t dstCap, uint16_t *lenInOut,
                         unsigned long deadlineMs, uint8_t *outTid) {
   uint16_t cap = *lenInOut;
@@ -586,7 +519,7 @@ static bool hsFragRecv(uint8_t *dst, uint16_t dstCap, uint16_t *lenInOut,
     bool shouldBeLast = (expected - done == fragDataLen);
     if (isLastFrag != shouldBeLast) return false;   // malformed LAST flag - protocol error
 
-    // ack it (echo the same flags/ofst back, addressed the other way)
+    // ack it: echo the flags and ofst back, addressed the other way
     {
       uint8_t ackHdr[FRAG_HDR_LEN];
       uint16_t p = 0;
@@ -607,16 +540,10 @@ static bool hsFragRecv(uint8_t *dst, uint16_t dstCap, uint16_t *lenInOut,
   }
 }
 
-// ============================================================================
-// DLP high-level request/response envelope
-// ============================================================================
+// ---- DLP request/response envelope ----
 
-// Sends a single-arg (or no-arg, argLen==0) HL DLP request using the "tiny"
-// arg wrapper (every non-streaming request here is comfortably under 255
-// bytes) and waits for its response. Returns false only on a transport-level
-// failure (no usable reply at all) - a non-zero DLP status in *errOut is
-// still a successful transaction as far as this function is concerned; the
-// caller decides what a given status code means.
+// Sends a single-arg (or no-arg) DLP request in the "tiny" arg wrapper (all are under 255 bytes) and waits for the response. False only on a transport failure; a non-zero
+// DLP status in *errOut is still a completed transaction, and the caller decides what it means.
 static bool hsDlpTxRx(uint8_t pktTyp, const uint8_t *argData, uint16_t argLen,
                        uint16_t *errOut, uint16_t *rspArgOfst, uint16_t *rspArgLen) {
   uint8_t txBuf[HS_RXBUF_SIZE];
@@ -628,12 +555,8 @@ static bool hsDlpTxRx(uint8_t pktTyp, const uint8_t *argData, uint16_t argLen,
     pos = hsPut8(txBuf, pos, (uint8_t) argLen);
     pos = hsPutBytes(txBuf, pos, argData, argLen);
   }
-  // Every real request in the reference is padded (with zero bytes, outside
-  // the formal arg length) to a minimum of 4 bytes and to an even total
-  // length - e.g. its own argless OpenConduit request tacks on a 2-byte
-  // "sbz" field despite nArgs=0, and DbClose's 1-byte arg gets one extra
-  // padding byte. Matching both rules generically here covers every call
-  // site without needing to special-case each one individually.
+  // The reference pads every request with zeros (outside the arg length) to at least 4 bytes and an even length (its argless OpenConduit carries a 2-byte "sbz" field,
+  // DbClose's 1-byte arg gets a pad). Doing both here covers every call site.
   while (pos < 4 || (pos & 1)) pos = hsPut8(txBuf, pos, 0);
 
   uint8_t tid = hsNextTid();
@@ -656,9 +579,7 @@ static bool hsDlpTxRx(uint8_t pktTyp, const uint8_t *argData, uint16_t argLen,
   return true;
 }
 
-// Parses at most one response arg (every opcode used in this file returns 0
-// or 1 args) - a simplification of the reference's fully general N-arg
-// parser, justified since nothing here ever needs more than one.
+// Parses at most one response arg (every opcode used here returns 0 or 1), a simplification of the reference's N-arg parser.
 static bool hsRspParseOneArg(const uint8_t *buf, uint16_t rxLen, uint16_t *argOfst, uint16_t *argLen) {
   uint8_t nArgs = buf[1];
   if (nArgs == 0) { *argOfst = 4; *argLen = 0; return true; }
@@ -683,25 +604,18 @@ static bool hsRspParseOneArg(const uint8_t *buf, uint16_t rxLen, uint16_t *argOf
   return true;
 }
 
-// ---- WAKE/INIT handshake ------------------------------------------------
+// ---- WAKE/INIT handshake ----
 
-// wakePayload is the already-defragmented raw WAKE packet body (struct
-// HsInitPkt equivalent: pktTyp,flags,ver[2],sbz[2],maxBaud[4] = 10 bytes).
-// Sends the INIT reply and returns the baud rate to switch to (0 on error -
-// matches hotsyncInit's own "0 = fail" convention).
+// wakePayload is the defragmented WAKE body (pktTyp, flags, ver[2], sbz[2], maxBaud[4] = 10 bytes). Sends the INIT reply and returns the baud to switch to (0 = failed, as hotsyncInit).
 static uint32_t hsHandshake(const uint8_t *wakePayload, uint16_t wakeLen, uint32_t desiredBaud) {
   if (wakeLen < 10) {
-    if (usbDebug) Serial.printf("HotSync: WAKE too short (%u bytes, need 10)\r\n", (unsigned) wakeLen);
+    LOGV("HotSync: WAKE too short (%u bytes, need 10)\r\n", (unsigned) wakeLen);
     return 0;
   }
-  // Validation matches pilot-link's own cmp_rx_handshake (libpisock/cmp.c)
-  // rather than the SASD reference firmware's stricter check (which also
-  // requires minor version <=3 and reserved==0) - a Palm is only
-  // guaranteed to send major version 1 in the high byte, and pilot-link
-  // itself never gates on the minor version or reserved bytes.
+  // Validated as pilot-link's cmp_rx_handshake is, not the stricter SASD firmware check (minor version <= 3, reserved == 0): a Palm only guarantees major version 1.
   if (wakePayload[0] != HS_PKT_WAKE || wakePayload[2] != 1) {
-    if (usbDebug) {
-      Serial.printf("HotSync: WAKE rejected - type=0x%02x ver=%u.%u sbz=%u\r\n",
+    if (logOn(LOG_WARN)) {
+      logPrintf(LOG_WARN, "HotSync: WAKE rejected - type=0x%02x ver=%u.%u sbz=%u\r\n",
                      wakePayload[0], wakePayload[2], wakePayload[3], hsGet16(wakePayload, 4));
     }
     return 0;
@@ -716,8 +630,8 @@ static uint32_t hsHandshake(const uint8_t *wakePayload, uint16_t wakeLen, uint32
     curBaud = (desiredBaud > maxBaud) ? maxBaud : desiredBaud;
   }
 
-  if (usbDebug) {
-    Serial.printf("HotSync: WAKE ok (ver=%u.%u, maxBaud=%lu) - sending INIT (curBaud=%lu)\r\n",
+  if (logOn(LOG_VERBOSE)) {
+    logPrintf(LOG_VERBOSE, "HotSync: WAKE ok (ver=%u.%u, maxBaud=%lu) - sending INIT (curBaud=%lu)\r\n",
                    wakePayload[2], wakePayload[3], (unsigned long) maxBaud, (unsigned long) curBaud);
   }
 
@@ -730,21 +644,20 @@ static uint32_t hsHandshake(const uint8_t *wakePayload, uint16_t wakeLen, uint32
   pos = hsPut16(init, pos, 0);
   pos = hsPut32(init, pos, curBaud);
 
-  if (usbDebug) {
-    // Confirm the actual UART rate at the moment we transmit (rules out a
-    // baud mismatch) and dump the exact CMP payload bytes about to go out
-    // (rules out an encoding bug) - both invisible from any higher-level log.
-    Serial.printf("HotSync: TX baud=%lu, INIT payload:", (unsigned long) PhysicalSerial.baudRate());
-    for (uint16_t i = 0; i < pos; i++) Serial.printf(" %02X", init[i]);
-    Serial.println();
+  if (logOn(LOG_VERBOSE)) {
+    // Log the real UART rate at the moment of sending (rules out a baud mismatch) and the exact CMP payload (rules out an encoding bug).
+    char hex[3 * 40 + 1];
+    size_t hp = 0;
+    for (uint16_t i = 0; i < pos && hp + 4 < sizeof(hex); i++) hp += snprintf(hex + hp, sizeof(hex) - hp, " %02X", init[i]);
+    logPrintf(LOG_VERBOSE, "HotSync: TX baud=%lu, INIT payload:%s", (unsigned long) PhysicalSerial.baudRate(), hex);
   }
 
   if (!hsFragSendOne(hsNextTid(), init, pos)) {
-    if (usbDebug) Serial.println("HotSync: INIT reply never got acked - handshake abandoned");
+    LOGW("HotSync: INIT reply never got acked - handshake abandoned");
     return 0;
   }
 
-  if (usbDebug) Serial.println("HotSync: INIT acked");
+  LOGV("HotSync: INIT acked");
 
   if (flags & HS_INIT_FLG_CHANGE_BAUDRATE) delay(100);   // let both ends settle before switching
 
@@ -777,7 +690,7 @@ static bool hsEndSync(uint16_t cause) {
   return err == 0;
 }
 
-// ---- DB create/delete/close ---------------------------------------------
+// ---- DB create/delete/close ----
 
 static bool hsDbDelete(const uint8_t name[32], uint16_t *errOut) {
   uint8_t arg[34];
@@ -790,7 +703,7 @@ static bool hsDbDelete(const uint8_t name[32], uint16_t *errOut) {
 
 static bool hsDbCreate(const uint8_t name[32], uint32_t type, uint32_t crid, uint16_t flags,
                         uint16_t version, uint8_t *handleOut, uint16_t *errOut) {
-  // crid(4)+type(4)+cardNo(1)+rfu(1)+flags(2)+version(2)+name(32) = 46 bytes
+  // crid 4 + type 4 + cardNo 1 + rfu 1 + flags 2 + version 2 + name 32 = 46 bytes
   uint8_t arg[46];
   uint16_t p = 0;
   p = hsPut32(arg, p, crid);
@@ -803,7 +716,7 @@ static bool hsDbCreate(const uint8_t name[32], uint32_t type, uint32_t crid, uin
 
   uint16_t argOfst, argLen;
   if (!hsDlpTxRx(HS_PKT_DB_CREATE, arg, p, errOut, &argOfst, &argLen)) return false;
-  if (*errOut) return true;   // transaction ok, but device reported an error - caller inspects *errOut
+  if (*errOut) return true;  // transaction ok, but the device reported an error: the caller inspects *errOut
   if (argLen < 1) return false;
   *handleOut = hsRxBuf[argOfst];
   return true;
@@ -816,10 +729,10 @@ static bool hsDbClose(uint8_t handle) {
   return err == 0;
 }
 
-// ---- resource/record/info-block streaming writes -------------------------
+// ---- resource/record/info-block streaming writes ----
 
 static bool hsResWriteBegin(uint8_t handle, uint32_t resType, uint16_t resID, uint16_t len) {
-  // header(2) + small-wrapper(4) + HsResWriteReq(dbHandle1+rfu1+resTyp4+resID2+resSize2=10) = 16 bytes
+  // header 2 + small-wrapper 4 + HsResWriteReq (dbHandle 1, rfu 1, resTyp 4, resID 2, resSize 2) = 16 bytes
   uint8_t hdr[16];
   uint16_t p = 0;
   p = hsPut8(hdr, p, HS_PKT_RES_WRITE);
@@ -848,7 +761,7 @@ static bool hsResWriteFinish() {
 }
 
 static bool hsRecWriteBegin(uint8_t handle, uint16_t size, uint32_t recID, uint8_t recAttrs, uint8_t category) {
-  // header(2) + small-wrapper(4) + HsRecWriteReq(dbHandle1+flags1+recID4+recAttrs1+category1=8) = 14 bytes
+  // header 2 + small-wrapper 4 + HsRecWriteReq (dbHandle 1, flags 1, recID 4, recAttrs 1, category 1) = 14 bytes
   uint8_t hdr[14];
   uint16_t p = 0;
   p = hsPut8(hdr, p, HS_PKT_REC_WRITE);
@@ -903,12 +816,8 @@ static bool hsInfoWriteFinish(bool appInfo) {
   return hsGet16(hsRxBuf, 2) == 0;
 }
 
-// ============================================================================
-// PRC/PDB file reader - shared header parse to PALM_DB_HDR_LEN (0x4E), then
-// branch on PALM_DB_ATTR_RESOURCE into a resource-entry (10B) or record-
-// entry (8B) reader. Extends the reference's prc.c (PRC-only) to also read
-// PDB files, plus optional AppInfo/SortInfo block extraction.
-// ============================================================================
+// ---- PRC/PDB reader: the header up to PALM_DB_HDR_LEN (0x4E), then a resource-entry (10 B) or record-entry (8 B) reader by PALM_DB_ATTR_RESOURCE.
+// Extends the reference's PRC-only prc.c to PDB files and the optional AppInfo/SortInfo blocks. ----
 
 struct HsDbEntry {
   uint32_t ofst;          // file offset of this entry's data (both kinds)
@@ -930,8 +839,9 @@ static struct {
   uint32_t    fileSize;
 } hsFile;
 
-// Reads exactly `n` bytes or fails. Small helper since File::read() can short-read.
+// Reads exactly n bytes or fails (File::read() can short-read).
 static bool hsFileReadExact(File &f, uint8_t *buf, uint16_t n) {
+  sdActivity();
   return f.read(buf, n) == n;
 }
 
@@ -942,15 +852,15 @@ static bool hsParseDbHeader(File &f, uint32_t size) {
   if (!hsFileReadExact(f, hdr, PALM_DB_HDR_LEN)) return false;
 
   memcpy(hsFile.name, hdr, 32);
-  hsFile.name[31] = 0;   // ensure NUL-terminated even if the file's name field is exactly 32 non-null bytes
+  hsFile.name[31] = 0;  // NUL-terminate even if the name field is 32 non-null bytes
   hsFile.dbAttrs = hsGet16(hdr, 32);
   hsFile.version = hsGet16(hdr, 34);
-  // offsets 0x24-0x33: crDate/modDate/bkupDate/modNum - not needed, skipped implicitly (not re-read)
+  // 0x24-0x33: crDate, modDate, bkupDate, modNum are not needed
   hsFile.appInfoOfst = hsGet32(hdr, 0x34);
   hsFile.sortInfoOfst = hsGet32(hdr, 0x38);
   hsFile.type = hsGet32(hdr, 0x3C);
   hsFile.crid = hsGet32(hdr, 0x40);
-  // 0x44-0x47: uniqueIDSeed - ignored
+  // 0x44-0x47: uniqueIDSeed, ignored
   uint32_t nextRecList = hsGet32(hdr, 0x48);
   if (nextRecList) return false;   // segmented record lists unsupported (matches reference)
   hsFile.numEntries = hsGet16(hdr, 0x4C);
@@ -989,15 +899,11 @@ static uint32_t hsEntrySize(uint16_t idx) {
   return nextOfst - hsFile.entries[idx].ofst;
 }
 
-// ============================================================================
-// Install driver
-// ============================================================================
+// ---- Install driver ----
 
 enum HsStreamTarget { HS_STREAM_RES, HS_STREAM_REC, HS_STREAM_INFO };
 
-// Streams one entry's raw bytes (resource, record, or AppInfo/SortInfo block
-// data) from `f` straight into whichever Write*Continue is currently active,
-// via a small fixed buffer - never holds a whole entry in RAM.
+// Streams one entry's bytes (resource, record or AppInfo/SortInfo data) from f into the active Write*Continue through a small fixed buffer; an entry is never held whole in RAM.
 static bool hsStreamEntryData(File &f, uint32_t ofst, uint32_t len, HsStreamTarget target) {
   if (!f.seek(ofst)) return false;
   uint8_t buf[256];
@@ -1018,67 +924,51 @@ static bool hsStreamEntryData(File &f, uint32_t ofst, uint32_t len, HsStreamTarg
   return true;
 }
 
-// Installs one already-open PRC/PDB file. `deleteFirst` selects the
-// INSTALL-folder policy (delete-then-reinstall) vs the SASD-folder policy
-// (skip-if-exists, no delete attempted). `forceReset` controls whether
-// PALM_DB_ATTR_RESET gets OR'd onto the file's own on-disk attrs.
-// `*wasInstalledOut`, if non-NULL, is set true iff this file was actually
-// created (not skipped because it already existed) - needed by the SASD
-// folder's own "any PRC installed -> force-override the PDB pass" rule.
+// Installs one open PRC/PDB. deleteFirst: INSTALL-folder policy (delete, then reinstall) or SASD-folder policy (skip if it exists). forceReset: OR PALM_DB_ATTR_RESET onto
+// the file's attrs. *wasInstalledOut (if not NULL) is true only if the file was created, not skipped (the SASD folder's "any PRC installed forces the PDB pass" rule needs it).
 static bool hsInstallFile(File &f, bool deleteFirst, bool forceReset, bool *wasInstalledOut) {
   if (wasInstalledOut) *wasInstalledOut = false;
 
   uint32_t size = f.size();
   if (!hsParseDbHeader(f, size)) {
-    if (usbDebug) Serial.printf("HotSync: '%s' - not a valid PRC/PDB header\r\n", f.name());
+    LOGW("HotSync: '%s' - not a valid PRC/PDB header\r\n", f.name());
     return false;
   }
 
   if (deleteFirst) {
     uint16_t delErr;
     if (!hsDbDelete(hsFile.name, &delErr)) {
-      if (usbDebug) Serial.printf("HotSync: delete '%s' - transport failure\r\n", f.name());
+      LOGW("HotSync: delete '%s' - transport failure\r\n", f.name());
     } else if (delErr == HS_ERR_NOT_FOUND) {
-      if (usbDebug) Serial.printf("HotSync: '%s' - not previously installed\r\n", f.name());
+      LOGV("HotSync: '%s' - not previously installed\r\n", f.name());
     } else if (delErr == 0) {
-      if (usbDebug) Serial.printf("HotSync: '%s' - deleted existing copy\r\n", f.name());
-    } else if (usbDebug) {
-      Serial.printf("HotSync: delete '%s' - err 0x%04x (continuing anyway)\r\n", f.name(), delErr);
+      LOGV("HotSync: '%s' - deleted existing copy\r\n", f.name());
+    } else if (logOn(LOG_WARN)) {
+      logPrintf(LOG_WARN, "HotSync: delete '%s' - err 0x%04x (continuing anyway)\r\n", f.name(), delErr);
     }
   }
 
-  // Real desktop installers (pilot-link's own pi_file_install(), libpisock/
-  // pi-file.c) pass the DB's on-disk attrs straight through - `flags =
-  // pf->info.flags;` - and only OR in the reset bit for one deliberate,
-  // narrow Graffiti-specific special case, never unconditionally. An
-  // earlier pass here always OR'd in PALM_DB_ATTR_RESET (copied from the
-  // SASD reference firmware's OWN deliberate choice, appropriate for ITS
-  // bootstrap-a-blank-device use case) for every install, which caused a
-  // real, unwanted Palm reset after installing an ordinary INSTALL-folder
-  // app that never asked for one. Now only forced for the SASD folder,
-  // matching the plan's own "drivers" framing for that folder specifically -
-  // the INSTALL folder passes the file's own attrs through unmodified, same
-  // as a real desktop install would.
+  // pilot-link's pi_file_install() passes the DB's own attrs through and sets the reset bit only in one narrow Graffiti case. Always setting it (the SASD firmware does,
+  // to bootstrap a blank device) reset the Palm after an ordinary INSTALL-folder app. So it is forced for the SASD folder only.
   uint16_t flags = hsFile.dbAttrs;
   if (forceReset) flags |= PALM_DB_ATTR_RESET;
   uint8_t handle;
   uint16_t crErr;
   if (!hsDbCreate(hsFile.name, hsFile.type, hsFile.crid, flags, hsFile.version, &handle, &crErr)) {
-    if (usbDebug) Serial.printf("HotSync: create '%s' - transport failure\r\n", f.name());
+    LOGW("HotSync: create '%s' - transport failure\r\n", f.name());
     return false;
   }
   if (crErr == HS_ERR_EXISTS && !deleteFirst) {
-    if (usbDebug) Serial.printf("HotSync: '%s' - already installed, skipping\r\n", f.name());
+    hsSkippedCount++;
+    LOGV("HotSync: '%s' - already installed, skipping\r\n", f.name());
     return true;   // not a failure - this is the expected skip path
   }
   if (crErr) {
-    if (usbDebug) Serial.printf("HotSync: create '%s' - err 0x%04x\r\n", f.name(), crErr);
+    LOGW("HotSync: create '%s' - err 0x%04x\r\n", f.name(), crErr);
     return false;
   }
 
-  // Create genuinely succeeded (not a skip) from here on - counts as
-  // "installed" for the caller's purposes even if a later write step fails,
-  // since the DB now exists on the device and installation was attempted.
+  // From here the DB exists on the device, so it counts as installed even if a later write fails.
   if (wasInstalledOut) *wasInstalledOut = true;
 
   bool ok = true;
@@ -1089,9 +979,8 @@ static bool hsInstallFile(File &f, bool deleteFirst, bool forceReset, bool *wasI
     if (hsInfoWriteBegin(handle, true, (uint16_t) len) &&
         hsStreamEntryData(f, hsFile.appInfoOfst, len, HS_STREAM_INFO) &&
         hsInfoWriteFinish(true)) {
-      // ok
     } else {
-      if (usbDebug) Serial.printf("HotSync: '%s' - AppInfo block write failed\r\n", f.name());
+      LOGW("HotSync: '%s' - AppInfo block write failed\r\n", f.name());
       ok = false;
     }
   }
@@ -1101,9 +990,8 @@ static bool hsInstallFile(File &f, bool deleteFirst, bool forceReset, bool *wasI
     if (hsInfoWriteBegin(handle, false, (uint16_t) len) &&
         hsStreamEntryData(f, hsFile.sortInfoOfst, len, HS_STREAM_INFO) &&
         hsInfoWriteFinish(false)) {
-      // ok
     } else {
-      if (usbDebug) Serial.printf("HotSync: '%s' - SortInfo block write failed\r\n", f.name());
+      LOGW("HotSync: '%s' - SortInfo block write failed\r\n", f.name());
       ok = false;
     }
   }
@@ -1123,19 +1011,19 @@ static bool hsInstallFile(File &f, bool deleteFirst, bool forceReset, bool *wasI
            hsStreamEntryData(f, hsFile.entries[i].ofst, entrySize, HS_STREAM_REC) &&
            hsRecWriteFinish();
     }
-    if (!ok && usbDebug) Serial.printf("HotSync: '%s' - entry %u write failed\r\n", f.name(), (unsigned) i);
+    if (!ok && logOn(LOG_WARN)) logPrintf(LOG_WARN, "HotSync: '%s' - entry %u write failed\r\n", f.name(), (unsigned) i);
   }
 
-  if (!hsDbClose(handle) && usbDebug) Serial.printf("HotSync: '%s' - close failed\r\n", f.name());
+  if (!hsDbClose(handle) && logOn(LOG_WARN)) logPrintf(LOG_WARN, "HotSync: '%s' - close failed\r\n", f.name());
 
-  if (ok && usbDebug) Serial.printf("HotSync: '%s' - installed\r\n", f.name());
+  if (ok) {
+    hsInstalledCount++;
+    LOGI("HotSync: '%s' - installed\r\n", f.name());
+  }
   return ok;
 }
 
-// Case-insensitive suffix compare, written by hand rather than relying on
-// strcasecmp() being in scope (not used elsewhere in this codebase, and its
-// declaration's availability without an explicit <strings.h> include isn't
-// worth gambling on here).
+// Case-insensitive suffix compare, by hand: strcasecmp() is not used elsewhere and needs <strings.h>.
 static bool hsHasExtension(const char *name, const char *ext) {
   size_t nameLen = strlen(name), extLen = strlen(ext);
   if (nameLen < extLen) return false;
@@ -1149,55 +1037,55 @@ static bool hsHasExtension(const char *name, const char *ext) {
   return true;
 }
 
-// True if the file's own basename starts with '.' - macOS AppleDouble
-// resource-fork sidecar files (e.g. "._Converter.prc", written alongside
-// the real file whenever macOS copies onto a non-HFS+ filesystem like a FAT
-// SD card) and ordinary Unix-style hidden files both match this. Without
-// this check "._Converter.prc" would ALSO pass hsHasExtension(name,".PRC")
-// (it's a real suffix match) and get installed as if it were a real PRC -
-// checked by basename, not raw name, so this is robust regardless of
-// whether File::name() returns a bare name or a full "/dir/name" path.
+// True if the basename starts with '.': macOS AppleDouble sidecars ("._Converter.prc", written when macOS copies onto FAT) and hidden files. Without it "._Converter.prc"
+// matches ".PRC" and is installed as a PRC. By basename, since File::name() may return a bare name or a full path.
 static bool hsIsDotfile(const char *name) {
   const char *slash = strrchr(name, '/');
   const char *base = slash ? slash + 1 : name;
   return base[0] == '.';
 }
 
-// True if `path` exists and is a directory (a lightweight existence check,
-// separate from actually scanning it - callers need this ahead of time to
-// decide whether to log "Install from X" and, for SASD, whether the PDB
-// pass should even be considered).
+// True if path exists and is a directory (a cheap check, ahead of scanning it).
 static bool hsFolderExists(const char *path) {
-  File dir = SD.open(path);
+  sdActivity();
+  File dir = hsFs->open(path);
   bool exists = dir && dir.isDirectory();
   if (dir) dir.close();
   return exists;
 }
 
-// Creates `path` as a directory if it doesn't already exist. SD.mkdir() on
-// the ESP32 FS layer is not guaranteed idempotent (some backends fail if the
-// target already exists), so this checks first via hsFolderExists() rather
-// than relying on mkdir()'s own return value to distinguish "already there"
-// from "really failed".
+// Creates path as a directory if missing. SD.mkdir() may fail when the target exists on some backends, so it checks first.
 static bool hsEnsureFolder(const char *path) {
   if (hsFolderExists(path)) return true;
-  if (!SD.mkdir(path)) {
-    if (usbDebug) Serial.printf("HotSync: could not create %s\r\n", path);
+  if (!hsFs->mkdir(path)) {
+    LOGW("HotSync: could not create %s\r\n", path);
     return false;
   }
-  if (usbDebug) Serial.printf("HotSync: created %s\r\n", path);
+  LOGV("HotSync: created %s\r\n", path);
   return true;
 }
 
-// Moves a just-installed file from the INSTALL folder into INSTALLED (see
-// hsInstallExt's `moveToDir` param) so a routine sync doesn't keep
-// reinstalling the same app/database every time. `srcPath` must be the
-// file's full path (File::path(), not File::name() - the latter is only
-// the basename) since it has to be a valid standalone argument to
-// SD.rename() after the File handle that opened it is closed. Best-effort:
-// a failure here is logged but does NOT fail the overall install (the
-// install itself already succeeded - worst case the file just gets
-// reinstalled, and this retried, next sync).
+// Moves a just-installed file from INSTALL into INSTALLED (hsInstallExt's moveToDir) so a routine sync does not reinstall it. srcPath is the full path (File::path(),
+// not name()), as SD.rename() needs after the handle is closed. Best-effort: a failure is logged and the install still counts (the file is just reinstalled next sync).
+// Picks and mounts the disk by the Disk setting: the SD card, the virtual card, or (Auto) the SD card if one answers, else the virtual card. Then makes sure the install
+// folders exist on it. False (nothing mounted) when there is no disk.
+bool hotsyncPrepareDisk() {
+  hsFs = &SD;
+  hsVirtual = false;
+  bool haveSd = sasdDiskMode != SASD_DISK_VIRTUAL && sdMount();
+  if (!haveSd) {
+    if (sasdDiskMode == SASD_DISK_SD || !vdiskPresent() || !vdfsMount()) return false;
+    hsFs = &vdfs();
+    hsVirtual = true;
+  }
+  LOGI("HotSync: installing from the %s\r\n", hsVirtual ? "virtual card (ESP32)" : "SD card");
+  static const char *const kDirs[] = { "/PALM", "/PALM/PROGRAMS", "/PALM/PROGRAMS/INSTALL",
+                                       "/PALM/PROGRAMS/SASD", "/PALM/PROGRAMS/INSTALLED" };
+  for (size_t i = 0; i < sizeof(kDirs) / sizeof(kDirs[0]); i++)
+    if (!hsEnsureFolder(kDirs[i])) break;
+  return true;
+}
+
 static void hsMoveToInstalled(const char *srcPath, const char *installedDir) {
   if (!hsEnsureFolder(installedDir)) return;
 
@@ -1206,41 +1094,30 @@ static void hsMoveToInstalled(const char *srcPath, const char *installedDir) {
   char destPath[96];
   snprintf(destPath, sizeof(destPath), "%s/%s", installedDir, base);
 
-  // A same-named file may already sit in INSTALLED from an earlier move
-  // (e.g. the exact same app re-uploaded to INSTALL and reinstalled) -
-  // SD.rename() fails if the destination already exists on this FS
-  // backend, so clear the old archived copy first. This is the archive
-  // copy only, not the live on-device DB - safe to just overwrite.
-  if (SD.exists(destPath)) SD.remove(destPath);
+  // A same-named file may already sit in INSTALLED from an earlier move, and rename fails if the destination exists: clear the archived copy first (not the on-device DB).
+  if (hsFs->exists(destPath)) hsFs->remove(destPath);
 
-  if (SD.rename(srcPath, destPath)) {
-    if (usbDebug) Serial.printf("HotSync: moved '%s' -> %s\r\n", base, installedDir);
-  } else if (usbDebug) {
-    Serial.printf("HotSync: could not move '%s' to %s (left in place)\r\n", base, installedDir);
+  if (hsFs->rename(srcPath, destPath)) {
+    LOGV("HotSync: moved '%s' -> %s\r\n", base, installedDir);
+  } else if (logOn(LOG_WARN)) {
+    logPrintf(LOG_WARN, "HotSync: could not move '%s' to %s (left in place)\r\n", base, installedDir);
   }
 }
 
-// Walks one folder for ONE extension, applying the given overwrite policy
-// to each file found. `*installedCountOut`, if non-NULL, is incremented for
-// every file actually installed (not skipped-as-already-existing) - the
-// SASD folder's own PRC-triggers-PDB-override rule needs this per-extension,
-// which is why this no longer bundles both passes like the earlier
-// `hsInstallFolder()` (renamed/split) did. `moveToDir`, if non-NULL, is
-// where a successfully-installed file gets relocated to afterward (the
-// INSTALL folder's own "don't reinstall every sync" behavior) - NULL for
-// the SASD folder, whose files are meant to stay in place and always be
-// checked for (see hsInstallFile's own comment on that folder's intent).
+// Walks one folder for one extension with the given overwrite policy. *installedCountOut (if not NULL) counts files actually installed, not skipped (per extension, for the
+// SASD PRC-triggers-PDB rule). moveToDir (if not NULL) is where an installed file goes afterwards (INSTALL folder); NULL for the SASD folder, whose files stay in place.
 static bool hsInstallExt(const char *path, const char *ext, bool deleteFirst, bool forceReset,
                           uint16_t *installedCountOut, const char *moveToDir) {
-  File dir = SD.open(path);
+  sdActivity();
+  File dir = hsFs->open(path);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close();
-    if (usbDebug) Serial.printf("HotSync: %s not found on SD card - skipping\r\n", path);
+    LOGV("HotSync: %s not found on SD card - skipping\r\n", path);
     return true;   // folder doesn't exist - not an error, just nothing to do
   }
 
   bool anyFail = false;
-  if (usbDebug) Serial.printf("HotSync: scanning %s for %s files\r\n", path, ext);
+  LOGV("HotSync: scanning %s for %s files\r\n", path, ext);
   uint16_t foundCount = 0;
   for (;;) {
     File f = dir.openNextFile();
@@ -1254,8 +1131,7 @@ static bool hsInstallExt(const char *path, const char *ext, bool deleteFirst, bo
     hsCurFileName[sizeof(hsCurFileName) - 1] = 0;
     hsLog(hsCurFileName);
 
-    // Captured before f.close() - path() isn't guaranteed valid on a
-    // closed handle, and it's needed below regardless of install outcome.
+    // Captured before f.close(): path() is not valid on a closed handle.
     char srcPath[96];
     strncpy(srcPath, f.path(), sizeof(srcPath) - 1);
     srcPath[sizeof(srcPath) - 1] = 0;
@@ -1268,10 +1144,9 @@ static bool hsInstallExt(const char *path, const char *ext, bool deleteFirst, bo
 
     if (installOk && wasInstalled && moveToDir) hsMoveToInstalled(srcPath, moveToDir);
   }
-  // Explicit even-when-zero result distinguishes an empty folder/no-
-  // matching-files pass from a scan that failed to enumerate anything.
-  if (usbDebug && foundCount == 0) {
-    Serial.printf("HotSync: no %s files found in %s\r\n", ext, path);
+  // An explicit zero tells an empty folder from a scan that failed to list anything.
+  if (logOn(LOG_VERBOSE) && foundCount == 0) {
+    logPrintf(LOG_VERBOSE, "HotSync: no %s files found in %s\r\n", ext, path);
   }
   dir.close();
   return !anyFail;
@@ -1280,16 +1155,8 @@ static bool hsInstallExt(const char *path, const char *ext, bool deleteFirst, bo
 static void hsInstallWalk(bool *anyFailOut) {
   bool anyFail = false;
 
-  // ---- SASD folder: PRC is skip-if-exists (files are "drivers", matching
-  // the original SASD hardware's own intent for that folder - see
-  // hsInstallFile's comment, forceReset=true). PDB files are only installed
-  // at all if at least one PRC was actually installed this run (not just
-  // found-and-skipped) - and when that happens, the PDB pass force-
-  // overrides (delete-then-reinstall) rather than skip-if-exists, since a
-  // freshly-(re)installed driver's own data files need to match it. A run
-  // where nothing new was installed must not touch PDBs at all, so a
-  // routine sync doesn't clobber user data alongside a driver that was
-  // already present.
+  // ---- SASD folder: PRCs are skip-if-exists ("drivers", forceReset). PDBs are installed only if a PRC was actually installed this run, and then delete-then-reinstall,
+  // since a fresh driver's data files must match it. A run that installed nothing new must not touch PDBs, so a sync does not clobber user data. ----
   hsLog("Checking SASD Dir");
   if (hsFolderExists("/PALM/PROGRAMS/SASD")) {
     hsLog("Install from SASD");
@@ -1297,23 +1164,18 @@ static void hsInstallWalk(bool *anyFailOut) {
     if (!hsInstallExt("/PALM/PROGRAMS/SASD", ".PRC", false, true, &prcInstalled, NULL)) anyFail = true;
     if (prcInstalled > 0) {
       const char *msg = "Initialization install triggered. PDB files will be installed.";
-      if (usbDebug) Serial.printf("HotSync: %s\r\n", msg);
-      hsLog(msg);   // OLED line naturally truncates to ~21 chars, same as any other long entry
+      LOGI("HotSync: %s\r\n", msg);
+      hsLog(msg);  // the OLED truncates to ~21 chars
       hsSasdInitTriggered = true;
       uint16_t pdbInstalled = 0;
       if (!hsInstallExt("/PALM/PROGRAMS/SASD", ".PDB", true /* force override */, true, &pdbInstalled, NULL))
         anyFail = true;
     }
-    // else: no PRC actually installed this run - PDB pass is skipped
-    // entirely (not even scanned), per the explicit requirement above.
+    // else: no PRC installed this run, so the PDB pass is skipped (not even scanned)
   }
 
-  // ---- INSTALL folder: general app installs, always delete-then-reinstall,
-  // never forces a reset - matches pilot-link's own pi_file_install(),
-  // which never does either. Successfully installed files are moved to a
-  // sibling INSTALLED folder afterward so a routine sync doesn't keep
-  // reinstalling the same app/database every time - unlike SASD's
-  // "drivers" folder, these files aren't meant to always be present in INSTALL.
+  // ---- INSTALL folder: general apps, always delete-then-reinstall, never forces a reset (as pilot-link's pi_file_install()). Installed files move to INSTALLED so a sync does
+  // not reinstall them. ----
   hsLog("Checking INSTALL Dir");
   if (hsFolderExists("/PALM/PROGRAMS/INSTALL")) {
     hsLog("Install from INSTALL");
@@ -1324,51 +1186,40 @@ static void hsInstallWalk(bool *anyFailOut) {
   *anyFailOut = anyFail;
 }
 
-// ============================================================================
-// Session driver - runs the whole handshake->install->endsync sequence
-// synchronously (same blocking-with-timeouts precedent already used by this
-// codebase's own ZMODEM transfer loops), since every step is individually
-// bounded by the frag layer's own ack-wait/resend timeouts - it cannot hang
-// indefinitely even though it blocks the Arduino loop() for its duration.
-// ============================================================================
+// ---- Session driver: handshake, install and EndSync run synchronously, as the ZMODEM loops do. Every step is bounded by the frag layer's ack wait and resends, so it
+// cannot hang, though it blocks loop() meanwhile. ----
 
-static void hsRunSession(const uint8_t *wakePayload, uint16_t wakeLen) {
+static bool hsRunSession(const uint8_t *wakePayload, uint16_t wakeLen) {
   uint32_t br = hsHandshake(wakePayload, wakeLen, (uint32_t) bauds[serialSpeed]);
   if (!br) {
-    if (usbDebug) Serial.println("HotSync: handshake failed");
-    return;   // stay in Waiting - never really connected, nothing to show as Completed
+    LOGW("HotSync: handshake failed");
+    return false;  // stay in Waiting: never connected, nothing to show as Completed
   }
 
   PhysicalSerial.begin(br, SERIAL_8N1, RXD2, TXD2);
   hsDrawHeader();
   hsSetState("Connected");
-  if (usbDebug) Serial.printf("HotSync: connected at %lu baud\r\n", (unsigned long) br);
+  LOGI("HotSync: connected at %lu baud\r\n", (unsigned long) br);
+  hsInstalledCount = hsSkippedCount = 0;
+  hsSessionStartMs = millis();
 
-  if (!hsOpenConduit() && usbDebug) Serial.println("HotSync: OpenConduit failed (continuing)");
+  if (!hsOpenConduit() && logOn(LOG_WARN)) logPrintf(LOG_WARN, "HotSync: OpenConduit failed (continuing)");
 
   uint32_t romVer = 0;
-  hsGetSysInfo(&romVer);   // best-effort - some devices refuse further requests without this, but we don't act on the value
+  hsGetSysInfo(&romVer);  // best-effort: some devices refuse later requests without it; the value is unused
 
   hsSetState("Syncing");
   bool anyFail = false;
   hsInstallWalk(&anyFail);
 
   bool endOk = hsEndSync(anyFail ? HS_END_CAUSE_OTHER : HS_END_CAUSE_NORMAL);
-  if (usbDebug) {
-    Serial.printf("HotSync: EndSync %s (cause=%s)\r\n", endOk ? "acked" : "not acked/failed",
+  if (logOn(LOG_WARN)) {
+    logPrintf(LOG_WARN, "HotSync: EndSync %s (cause=%s)\r\n", endOk ? "acked" : "not acked/failed",
                    anyFail ? "OTHER (install had failures)" : "NORMAL");
   }
 
-  // A freshly-installed/updated DB with PALM_DB_ATTR_RESET (set on every
-  // create in hsInstallFile) makes real Palm OS auto-reset itself once the
-  // sync ends, to load the new code - this is standard desktop-HotSync
-  // install behavior, not something WiRSa requests, and it's exactly why
-  // the line goes noisy right after EndSync (reset/reboot chatter from the
-  // Palm's own side). Drain RX both before and after the baud switch back -
-  // same real-hardware fix already proven for SASD mode's own "stray bytes
-  // leak into the next mode's keystroke parser" bug (see exitSasdMode()) -
-  // anything arriving during the brief gap at the OLD rate would also just
-  // be garbage at the NEW rate.
+  // A DB installed with PALM_DB_ATTR_RESET makes the Palm reset itself after the sync to load the new code (standard HotSync behaviour), hence the noise on the line after
+  // EndSync. Drain RX before and after the switch back, as exitSasdMode() does for stray bytes leaking into the next mode's key parser; bytes arriving at the old rate are garbage at the new one.
   while (PhysicalSerial.available()) PhysicalSerial.read();
   PhysicalSerial.flush();
   PhysicalSerial.end();
@@ -1379,35 +1230,34 @@ static void hsRunSession(const uint8_t *wakePayload, uint16_t wakeLen) {
   hsDrawHeader();
   hsSetState(hsSasdInitTriggered ? "Init Complete" : "Completed");
   hsLog("Hotsync completed");
-  if (usbDebug) Serial.println("HotSync: session complete");
+  LOGI("HotSync: session complete - %lu installed, %lu already there%s, %lus\r\n", (unsigned long) hsInstalledCount,
+       (unsigned long) hsSkippedCount, anyFail ? ", WITH ERRORS" : "", (unsigned long) ((millis() - hsSessionStartMs) / 1000));
+  return true;
 }
 
-// Non-blocking-ish peek for a WAKE packet: returns immediately if nothing
-// has arrived yet (so hotsyncLoop() stays responsive), otherwise blocks up
-// to 1s to receive the rest of whatever just started arriving - safe since
-// WAKE always transmits at the fixed 9600 listen baud (~25ms for the whole
-// ~26-byte packet), so 1s is a very generous margin, not a real stall risk.
+// Peeks for a WAKE: returns at once if nothing arrived (loop() stays responsive), else blocks up to 1 s for the rest. WAKE is at the fixed 9600 listen baud (~25 ms for ~26 bytes).
 static bool hsPollForWake(uint8_t *outPayload, uint16_t *outLen) {
   if (!PhysicalSerial.available()) return false;
 
-  if (usbDebug) Serial.println("HotSync: bytes arriving, trying to sync on a WAKE packet...");
+  LOGV("HotSync: bytes arriving, trying to sync on a WAKE packet...");
 
   uint16_t len = *outLen;
   uint8_t tid;
   unsigned long deadline = millis() + 1000;
   if (!hsFragRecv(outPayload, len, &len, deadline, &tid)) {
-    if (usbDebug) Serial.println("HotSync: gave up on this byte burst (no valid packet synced in time)");
+    LOGV("HotSync: gave up on this byte burst (no valid packet synced in time)");
     return false;
   }
-  if (usbDebug) Serial.printf("HotSync: got a %u-byte packet, checking if it's a valid WAKE\r\n", (unsigned) len);
+  LOGV("HotSync: got a %u-byte packet, checking if it's a valid WAKE\r\n", (unsigned) len);
 
   *outLen = len;
   return true;
 }
 
-// ============================================================================
-// Public API
-// ============================================================================
+// ---- Public API ----
+
+// Back to the main menu on the shared Exit Timers (mode_timer.h): no HotSync within the "unused" time of entering, or the "after" time once one finished.
+static ModeExitTimer hsTimer;
 
 void enterHotsyncMode() {
   menuMode = MODE_FILE;   // repurposed slot - see globals.h
@@ -1420,37 +1270,32 @@ void enterHotsyncMode() {
   hsSasdInitTriggered = false;
 
   PhysicalSerial.begin(9600, SERIAL_8N1, RXD2, TXD2);   // protocol-mandated fixed listen baud
+  modeTimerStart(hsTimer);
+  LOGI("HotSync: mode entered - waiting for the Palm");
   hsDrawHeader();
   hsSetState("Waiting");
 }
 
 static void hsExit() {
-  // Same drain-before-and-after-the-baud-switch fix as hsRunSession's own
-  // post-EndSync transition (see its comment) - needed here too since BTNBK
-  // or the 15s auto-timeout can both fire while the Palm still has residual
-  // traffic in flight (mid-transfer abort, or reset/reboot chatter right
-  // after a completed sync that hasn't fully drained yet).
+  if (hsVirtual) { vdfsUnmount(); hsVirtual = false; hsFs = &SD; }
+  // Drain before and after the baud switch, as after EndSync: BTNBK or the 15 s timeout can fire while the Palm still has traffic in flight.
   while (PhysicalSerial.available()) PhysicalSerial.read();
   PhysicalSerial.flush();
   PhysicalSerial.end();
   delay(200);
-  PhysicalSerial.begin(bauds[serialSpeed], WIRSA_SERIAL_FORMAT, RXD2, TXD2);
+  PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT, RXD2, TXD2);   // the menu's current rate (palm_ctl.h)
   while (PhysicalSerial.available()) PhysicalSerial.read();
 
-  // hotsync.cpp draws its own title/status directly (hsDrawHeader()/
-  // hsDrawStatus()), bypassing showHeader()'s normal border+clear entirely -
-  // it never touches `lastMenu`. showHeader() only does its own full
-  // display.clearDisplay() + left/right/bottom border redraw when
-  // `lastMenu != menuMode`; if the user came here straight from the main
-  // menu (lastMenu was already MODE_MAIN before HotSync ever ran), that
-  // check is false and showHeader() only clears a small selection-highlight
-  // rect, leaving HotSync's own leftover pixels - including a missing/
-  // corrupted border - on screen. Force the same "full redraw" path every
-  // other real mode transition already gets, matching the established
-  // `msgFlag=true; //force full menu redraw` idiom used elsewhere in this
-  // codebase (modem.cpp) for exactly this situation.
+  // This mode draws its own title and status (hsDrawHeader()/hsDrawStatus()) and never touches lastMenu. showHeader() redraws fully only when lastMenu != menuMode, so
+  // coming straight from the main menu would leave HotSync's pixels (and a damaged border) on screen. Force the full redraw other mode changes get (msgFlag, as modem.cpp did).
   msgFlag = true;
+  LOGI("HotSync: mode exit");
   mainMenu(false);
+}
+
+// BOOT pressed again while still waiting for the Palm: leave, as BACK. Ignored once a session has started.
+void hotsyncCancelWait() {
+  if (menuMode == MODE_FILE && hsState == HS_WAITING) hsExit();
 }
 
 void hotsyncLoop() {
@@ -1463,14 +1308,32 @@ void hotsyncLoop() {
   waitSwitches();
 
   if (hsState == HS_WAITING) {
+    // Palm control link (palm_ctl.h): PING/STATUS from WiRSaCtl, and EXIT (only while waiting).
+    if (palmCtlModeHook('H', true, 0)) {
+      hsExit();
+      return;
+    }
+    if (modeTimerExpired(hsTimer)) {
+      LOGI("HotSync: exit timer - back to the main menu");
+      hsExit();
+      return;
+    }
+#if WIRSA_FEATURE_PALMCTL
+    // A control frame is for palmCtlModeHook on the next pass; the WAKE scanner below would swallow it.
+    if (PhysicalSerial.available() && PhysicalSerial.peek() == RelayProto::CTL_LEAD) return;
+#endif
     uint8_t wakeBuf[32];
     uint16_t wakeLen = sizeof(wakeBuf);
     if (hsPollForWake(wakeBuf, &wakeLen)) {
-      hsRunSession(wakeBuf, wakeLen);
-      hsState = HS_DONE;
-      hsDoneAtMs = millis();
+      bool ran = hsRunSession(wakeBuf, wakeLen);   // blocks for the whole session
+      if (ran) modeTimerSessionEnded(hsTimer);
+      // "After" timer 0 = never leave: listen for the next HotSync. A packet that was not a real WAKE keeps waiting too.
+      if (ran && modeAfterExitSec) {
+        hsState = HS_DONE;
+        hsDoneAtMs = millis();
+      }
     }
   } else if (hsState == HS_DONE) {
-    if (millis() - hsDoneAtMs > 15000) hsExit();
+    if (modeTimerExpired(hsTimer)) hsExit();
   }
 }

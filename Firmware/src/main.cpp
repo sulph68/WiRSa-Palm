@@ -39,40 +39,7 @@
  https://github.com/contrem/arduino-timer
  **************************************************************************/
 
- /*
- changes 3.10
- - modified signal monitor to show on screen while in modem mode
- - fixed telnet call mode to assert DCD
- - fixed some pin polarity issues
-
- this fork vs. the original nullvalue0/WiRSa firmware (https://github.com/nullvalue0/WiRSa)
-
- added:
- - HotSync Install mode - pushes .PRC/.PDB files from an SD card to the Palm over a real HotSync session
- - SASD (Serial-Attached SD Card) mode - lets the Palm browse/use the SD card as mass storage over serial
- - BitWarden Relay mode - bridges a Palm password-manager client to a Vaultwarden server over WiFi
- - FTP Server mode - background FTP server for browsing/editing the SD card over WiFi
- - background WiFi auto-connect/reconnect with a live signal-strength status icon on every title bar
- - per-feature compile-time toggles (WIRSA_FEATURE_*) to build a trimmed-down firmware
-
- removed:
- - MODEM Mode - the original's Hayes AT-command dial-up/telnet/BBS modem emulation is gone entirely
- - PPP Gateway - superseded by SLIP Gateway
- - built-in web server for status monitoring/file management - superseded by FTP Server
- - File Transfer (XMODEM/YMODEM/ZMODEM) as a standalone menu - its mode slot was repurposed for HotSync, no longer reachable
- - Text Playback from SD card - its mode slot was repurposed for SASD, no longer reachable
- - 10 speed-dial entries - only usable for dialing in MODEM Mode; storage/EEPROM plumbing (speedDials[]/DIAL0-9_ADDRESS) had actually been left behind despite this note, confirmed zero real consumer, and was fully removed in a later size-cleanup pass
- - RTS/CTS hardware flow control and DTR signaling - not wired on this hardware
- - Utilities menu items Auto-Detect Baud, Hex Dump Mode toggle, Loopback Test, Signal Monitor, and the whole AT$SIG/AT$LOOP/AT$HEX/AT$BAUD?/AT$SYS/AT$STAT command dispatcher - this note previously claimed they "stay reachable via AT$..." but that was never true post-MODEM-Mode-removal (confirmed zero callers of the dispatcher itself); genuinely removed in the same size-cleanup pass as the speed-dial entries above. hexDumpByte() is the one function of this whole family left in place (still called from serial_io.cpp) since its own enabling flag can now never be set true - functionally inert rather than actually dead code.
- - echo/autoAnswer/petTranslate/consoleMode/IP_TYPE settings and their EEPROM storage - same MODEM-Mode-era pattern: round-tripped through EEPROM every boot, zero real consumer anywhere, removed in the same pass
- - serialConfig/bits[]/bitsDisp[] (24-entry SERIAL_5N1..SERIAL_8O2 config table + display labels) - serialConfig was only ever ASSIGNED via EEPROM.read(), never WRITTEN by any live UI (that menu was already gone), so it was permanently stuck at its default; the 5 real PhysicalSerial.begin() call sites now use WIRSA_SERIAL_FORMAT directly, same as the CalDAV/BitWarden relay modes already did
-
- other behavior:
- - SLIP Gateway starts immediately from the main menu instead of opening a submenu first; BACK returns to that submenu
- - live baud rate shown on every screen's title bar, including BitWarden Relay and SLIP Gateway
- - Utilities' Information screen is a scrollable status view instead of a fixed popup that could overflow the screen
- - globals.h is the single source of truth for pin/EEPROM #define blocks (main.cpp/network.cpp/settings.cpp no longer keep their own copies)
- */
+// Changes against the original firmware: docs/CHANGELOG.md.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -85,36 +52,45 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "SD.h"
-//#include "FS.h"
 #include "arduino-timer.h"
 #include <HardwareSerial.h>
 
-// Project modules
+// project modules
 #include "globals.h"
+#include "led.h"
 #include "serial_io.h"
 #include "settings.h"
 #include "network.h"
 #include "display_menu.h"
+#include "modes.h"
 #include "firmware.h"
 #include "ftp_server.h"    // Background FTP server (replaces MODEM mode + web config)
 #include "slip_mode.h"     // SLIP gateway mode
 #include "sasd.h"          // Serial-attached SD mode
 #include "hotsync.h"        // HotSync Install mode
+#include "boot_button.h"
+#include "palm_ctl.h"       // menuKey(), dual-rate menu
+#include "deep_sleep.h"     // deep sleep after idle (T7-S3)
 #include "wifi_setup.h"    // WiFi setup wizard
 #include "diagnostics.h"   // Diagnostic tools
 #include "bitwarden_relay.h" // BitWarden Relay mode (Vaultwarden serial bridge)
 #include "caldav_relay.h" // CalDAV Relay mode (calendar sync serial bridge)
+#include "mesh_relay.h" // Mesh Relay mode (Meshtastic node over Bluetooth)
 
-// globals.h is the canonical copy for EEPROM-address, pin, and menu-mode
-// constants: VERSIONA/B, every *_ADDRESS/*_LEN EEPROM layout constant,
-// SWITCH_PIN/LED_PIN, SW1-4_PIN, MENU_BOTH/NUM/DISP,
-// SCREEN_WIDTH/HEIGHT/OLED_RESET/SCREEN_ADDRESS, SD_CS/SPI_*, RXD2/TXD2 -
-// this file has no local copies of any of those, so there's exactly one
-// place to manage each. OLED_SDA/OLED_SCL are not in globals.h (I2C pins,
-// only ever needed here for the Wire.begin() call below).
+// globals.h holds the EEPROM-address, pin and menu-mode constants (VERSIONA/B, the *_ADDRESS/*_LEN layout, SWITCH_PIN/LED_PIN, SW1-4_PIN, MENU_*, SCREEN_*, SD_CS/SPI_*, RXD2/TXD2); this file
+// keeps no copies. OLED_SDA/OLED_SCL are not there (I2C pins, needed only for Wire.begin() below).
+#if defined(WIRSA_BOARD_T7S3)
+#define OLED_SDA I2C_SDA_PIN   // Qwiic bus (no OLED on this board)
+#define OLED_SCL I2C_SCL_PIN
+#else
 #define OLED_SDA 21
 #define OLED_SCL 20
+#endif
+#if WIRSA_HAS_DISPLAY
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#else
+NullDisplay display;   // screenless build - see globals.h/null_display.h
+#endif
 
 // CRC-16 CCITT table
 const uint16_t crc16_ccitt_table[256] PROGMEM = {
@@ -152,86 +128,48 @@ const uint16_t crc16_ccitt_table[256] PROGMEM = {
   0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
 };
 
-// Relocated from file_transfer.cpp during its removal (XMODEM/YMODEM/ZMODEM
-// file transfer, confirmed unreachable from the main menu) - sasd.cpp and
-// hotsync.cpp both still call this for their own shared slk-layer CRC (see
-// its declaration in globals.h). The CRC-32 table that used to live here
-// too (crc32tab[]) had no other consumer and was removed with the rest.
+// Relocated from file_transfer.cpp when it was removed; sasd.cpp and hotsync.cpp use it for their slk-layer CRC (declared in globals.h). The CRC-32 table that lived here had no other consumer and went too.
 uint16_t zmCRC16Update(uint16_t crc, uint8_t b) {
   return (crc << 8) ^ pgm_read_word(&crc16_ccitt_table[(crc >> 8) ^ b]);
 }
 
-// Global variables
-String build = "v3.10";
+// globals
+String build = "v1.1";
 String cmd = "";              // Gather a new AT command to this string from serial
 bool cmdMode = true;          // Are we in AT command mode or connected mode
 bool verboseResults = false;
-//#define DEBUG 1             // Print additional debug information to serial channel
 #undef DEBUG
-// TX_BUF_SIZE is defined in globals.h only - the variables below resolve
-// their values from there.
+// TX_BUF_SIZE is defined in globals.h only.
 unsigned long lastRingMs = 0; // Time of last "RING" message (millis())
-//long myBps;                 // What is the current BPS setting
 char plusCount = 0;           // Go to AT mode at "+++" sequence, that has to be counted
 unsigned long plusTime = 0;   // When did we last receive a "+++" sequence
 unsigned long ledTime = 0;
-// (TX_BUF_SIZE's own buffer fill direction is very blocking by the ESP TCP
-// stack, so we can't do one byte a time.)
+// (the ESP TCP stack fills TX_BUF_SIZE's buffer in blocks, so it cannot be one byte at a time)
 uint8_t txBuf[TX_BUF_SIZE];
 
-extern const int bauds[] = { 300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200 };
-String baudDisp[] = { "300", "1200", "2400", "4800", "9600", "19.2k", "38.4k", "57.6k", "115k" };
+// Nothing below 9600 is used (the Palm line has not run slower since the first WiRSaCtl).
+extern const int bauds[] = { 9600, 14400, 19200, 28800, 38400, 57600, 115200 };
+String baudDisp[] = { "9600", "14.4k", "19.2k", "28.8k", "38.4k", "57.6k", "115k" };
 byte serialSpeed;
 
-// Feature build flags (globals.h) turn menu ITEMS (and their whole
-// implementation) on/off at compile time - both mainMenuDisp[] and
-// settingsMenuDisp[] used to be fixed initializer lists, but a disabled
-// item can't just leave a gap (every LATER item's array position, and every
-// menuSel== comparison in mainLoop()/settingsLoop() that keys off that
-// position, has to shift down to fill it). Fixed-size arrays + a runtime
-// COUNT + named runtime INDEX variables (buildMainMenu()/buildSettingsMenu()
-// below, called once from setup()) replace the old static initializers so
-// each enabled item lands wherever it actually ends up, and the dispatch
-// code below compares against the resulting index instead of a literal.
-String mainMenuDisp[8];
+// Feature build flags (globals.h) turn menu items and their code on or off at compile time. A disabled item cannot leave a gap (every later item's position, and every menuSel== comparison
+// in mainLoop()/settingsLoop() that uses it, must shift down). So fixed-size arrays, a runtime COUNT and named runtime INDEX variables (buildMainMenu()/buildSettingsMenu(), called once from setup())
+// replace the static initializers, and the dispatch code compares against the index, not a literal.
+String mainMenuDisp[10];
 int mainMenuCount = 0;
-int mmIdxFtp = -1, mmIdxHotsync = -1, mmIdxSasd = -1, mmIdxSlip = -1, mmIdxBitwarden = -1, mmIdxCalDav = -1, mmIdxUtilities = -1, mmIdxConfig = -1;
 
 void buildMainMenu() {
-  mainMenuCount = 0;
-#if WIRSA_FEATURE_FTPSERVER
-  mmIdxFtp = mainMenuCount; mainMenuDisp[mainMenuCount++] = "FTP Server";
-#endif
-#if WIRSA_FEATURE_HOTSYNC
-  mmIdxHotsync = mainMenuCount; mainMenuDisp[mainMenuCount++] = "HotSync";
-#endif
-#if WIRSA_FEATURE_SASD
-  mmIdxSasd = mainMenuCount; mainMenuDisp[mainMenuCount++] = "SAS[D] SDCard";
-#endif
-#if WIRSA_FEATURE_SLIP
-  mmIdxSlip = mainMenuCount; mainMenuDisp[mainMenuCount++] = "SLIP Gateway";
-#endif
-#if WIRSA_FEATURE_BITWARDEN
-  mmIdxBitwarden = mainMenuCount; mainMenuDisp[mainMenuCount++] = "BitWarden Relay";
-#endif
-#if WIRSA_FEATURE_CALDAV
-  mmIdxCalDav = mainMenuCount; mainMenuDisp[mainMenuCount++] = "C[A]lDAV Relay";
-#endif
-#if WIRSA_FEATURE_UTILITIES
-  mmIdxUtilities = mainMenuCount; mainMenuDisp[mainMenuCount++] = "Utilities";
-#endif
-  mmIdxConfig = mainMenuCount; mainMenuDisp[mainMenuCount++] = "Config";  // always built, never gated
+  // The entries are the table's built rows with a label, in row order (modes.h); the last one is Config, always built.
+  const char *labels[10];
+  mainMenuCount = Modes::menuEntries(labels, 10);
+  for (int i = 0; i < mainMenuCount; i++) mainMenuDisp[i] = labels[i];
 }
 
-// "FTP Setup" would auto-bracket to the same "[F]..." serial hint as
-// "Factory Reset", and "AP Setup" to the same "[A]..." as "About" - both
-// real keys are 'T'/'P' (settingsLoop() below), not the literal first
-// letter, so both need an explicit inline "[X]" hint (same convention
-// mainMenuDisp's own "SAS[D] SDCard" already uses) rather than relying on
-// showMenu()'s auto-bracket-first-letter fallback.
-String settingsMenuDisp[10];
+// "FTP Setup" would auto-bracket to the same "[F]..." hint as "Factory Reset", and "AP Setup" to the same "[A]..." as "About", but the real keys are 'T' and 'P' (settingsLoop()), so both carry
+// an explicit inline "[X]" (as mainMenuDisp's "SAS[D] SDCard") instead of showMenu()'s auto-bracket-first-letter fallback.
+String settingsMenuDisp[12];
 int settingsMenuCount = 0;
-int smIdxMain = -1, smIdxWifiSetup = -1, smIdxFtpSetup = -1, smIdxApSetup = -1, smIdxBaud = -1, smIdxOrientation = -1, smIdxUsbDebug = -1, smIdxFactoryReset = -1, smIdxReboot = -1, smIdxAbout = -1;
+int smIdxMain = -1, smIdxWifiSetup = -1, smIdxFtpSetup = -1, smIdxApSetup = -1, smIdxSlipSetup = -1, smIdxBaud = -1, smIdxOrientation = -1, smIdxUsbDebug = -1, smIdxExitTimers = -1, smIdxFactoryReset = -1, smIdxReboot = -1, smIdxAbout = -1;
 
 void buildSettingsMenu() {
   settingsMenuCount = 0;
@@ -241,21 +179,25 @@ void buildSettingsMenu() {
   smIdxFtpSetup = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "F[T]P Setup";
   smIdxApSetup = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "A[P] Setup";
 #endif
+#if WIRSA_FEATURE_SLIP
+  smIdxSlipSetup = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "SLIP Setup";
+#endif
+#if WIRSA_FEATURE_PALMCTL && WIRSA_FEATURE_DUAL_BAUD
+  smIdxBaud = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "Baud Rate (Max)";
+#else
   smIdxBaud = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "Baud Rate";
+#endif
   smIdxOrientation = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "Orientation";
   smIdxUsbDebug = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "USB Debug";
+  smIdxExitTimers = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "Exit Timers";
   smIdxFactoryReset = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "Factory Reset";
   smIdxReboot = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "Reboot";
   smIdxAbout = settingsMenuCount; settingsMenuDisp[settingsMenuCount++] = "About";
 }
 String orientationMenuDisp[] = { "Normal", "Flipped" };
 String defaultModeDisp[] = { "Main Menu", "MODEM Mode" };
-// Auto-Detect Baud/Hex Dump Mode/Loopback Test/Signal Monitor were never
-// Utilities menu items, and (unlike this comment used to claim) weren't
-// actually reachable via AT$BAUD?/AT$HEX/AT$LOOP/AT$SIG either - the
-// dispatcher those AT commands went through had zero real callers left
-// anywhere once MODEM Mode's own command parser was removed. Confirmed
-// and removed for real in a later size-cleanup pass (see globals.h).
+// Auto-Detect Baud, Hex Dump Mode, Loopback Test and Signal Monitor were never Utilities items, and were not reachable via AT$BAUD?/AT$HEX/AT$LOOP/AT$SIG either: that dispatcher had no callers once
+// MODEM mode's parser went. Removed in a later size cleanup (see globals.h).
 String diagnosticsMenuDisp[] = { "Main Menu", "Retry WiFi", "Information" };
 
 bool quietMode = false;        // ATQ1 suppresses result codes
@@ -269,14 +211,11 @@ String resultCodes[] = { "OK", "CONNECT", "RING", "NO CARRIER", "ERROR", "", "NO
 enum resultCodes_t { R_OK_STAT, R_CONNECT, R_RING, R_NOCARRIER, R_ERROR, R_NONE, R_NODIALTONE, R_BUSY, R_NOANSWER };
 unsigned long connectTime = 0;
 bool bHex = false;
-// This device uses automatic flow control only, no hardware flow control -
-// FLOW_CONTROL_ADDRESS (119) and DTR_MODE_ADDRESS (121) EEPROM slots exist
-// but are left unused rather than reassigned; see settings.cpp.
+// No hardware flow control: FLOW_CONTROL_ADDRESS (119) and DTR_MODE_ADDRESS (121) exist but stay unused rather than reassigned (see settings.cpp).
 enum dispOrientation_t { D_NORMAL, D_FLIPPED }; // Normal or Flipped
 byte dispOrientation = D_NORMAL;
 enum defaultMode_t { D_MAINMENU, D_MODEMMENU }; // Main or Modem
 byte defaultMode = D_MAINMENU;
-bool usbDebug = true;  // Enable USB serial debug output (default: enabled)
 
 int menuMode = MODE_MAIN;
 int lastMenu = -1;
@@ -304,69 +243,46 @@ extern const uint8_t PROGMEM wifi_symbol[] = {
 };
 
 MDNSResponder mdns;
-HardwareSerial PhysicalSerial(2);
+HardwareSerial PhysicalSerial(WIRSA_PALM_UART);
 
-// Serial I/O functions moved to src/modules/serial_io.cpp
-// Settings functions moved to src/modules/settings.cpp
-// Network functions moved to src/modules/network.cpp
-// Menu-loop functions (mainLoop, baudLoop, orientationLoop, settingsLoop,
-// ftpServerLoop, getLine, prompt, led_on, checkCancel, clearInputBuffer,
-// printSDCardInfo) moved to src/modules/display_menu.cpp
+// Serial I/O is in src/modules/serial_io.cpp, settings in settings.cpp, network in network.cpp, and the menu loops (mainLoop, baudLoop, orientationLoop, settingsLoop, ftpServerLoop, led_on,
+// printSDCardInfo) in display_menu.cpp.
 
-// Forward declarations for functions still in main.cpp
+// forward declarations for functions still in main.cpp
 void showMessage(String message);
 void showMenu(String menuName, String options[], int sz, int dispMode, int defaultSel);
 void menuOption(int idx, String item);
 void settingsMenu(bool arrow);
 void baudMenu(bool arrow);
 void orientationMenu(bool arrow);
-String getLine();
-void clearInputBuffer();
-bool checkCancel();
 
-// ============================================================================
-// MODEM mode removed entirely (AT-command dial-up/telnet emulation,
-// modem.cpp) - replaced by the background FTP server (ftp_server.cpp/.h).
-// Some of what used to live in modem.cpp was genuinely modem-specific and
-// was deleted with it (connectTimeString, sendString, checkButton,
-// displayCurrentSettings/StoredSettings, waitForSpace/waitForEnter,
-// displayHelp, storeSpeedDial, hangUp, led_on's modem-only callers,
-// answerCall, handleIncomingConnection, command() the AT parser,
-// handleFlowControl, enterModemMode, modemLoop, refreshDisplay). The rest
-// wasn't actually modem-specific - it was the general menu-loop
-// infrastructure (mainLoop, baudLoop, orientationLoop, settingsLoop,
-// getLine, prompt, led_on, printSDCardInfo, sendResult) that other kept
-// features (slip_mode.cpp) also depended on - that was relocated to
-// src/modules/display_menu.cpp instead, alongside its existing *Menu()
-// counterparts.
-// ============================================================================
+// MODEM mode (AT-command dial-up and telnet emulation, modem.cpp) is removed, replaced by the background FTP server (ftp_server.cpp/.h). What was modem-specific went with it (connectTimeString,
+// sendString, checkButton, displayCurrentSettings/StoredSettings, waitForSpace/waitForEnter, displayHelp, storeSpeedDial, hangUp, answerCall, handleIncomingConnection, the AT parser command(),
+// handleFlowControl, enterModemMode, modemLoop, refreshDisplay). The general menu-loop code that other features need (mainLoop, baudLoop, orientationLoop, settingsLoop, led_on, printSDCardInfo)
+// moved to display_menu.cpp.
 
-// File Transfer (XModem/YModem/ZModem over fileMenu/fileLoop/protocolMenu/
-// protocolLoop/listFilesMenu/listFilesLoop in display_menu.cpp, plus all of
-// src/modules/file_transfer.cpp/include/file_transfer.h itself) was
-// confirmed unreachable from the main menu - MODE_FILE, its old mode slot,
-// had already been repurposed for HotSync Install (see globals.h/hotsync.h)
-// - and has since been removed entirely. Only zmCRC16Update() (now defined
-// just above the CRC-16 table it reads, declared in globals.h) survived,
-// since sasd.cpp/hotsync.cpp both still use it for their own shared
-// slk-layer CRC. src/modules/playback.cpp/include/playback.h went with it -
-// their own remaining content (displayChar/listFiles/getFileSize) existed
-// only to support File Transfer (its own header comment said so), and had
-// zero other callers once that was gone.
+// File Transfer (XMODEM/YMODEM/ZMODEM: fileMenu/fileLoop/protocolMenu/protocolLoop/listFilesMenu/listFilesLoop in display_menu.cpp, and src/modules/file_transfer.cpp/.h) was unreachable
+// (MODE_FILE had become HotSync Install) and is removed. Only zmCRC16Update() survives (above the CRC-16 table it reads, declared in globals.h), for sasd.cpp and hotsync.cpp. playback.cpp/.h went
+// too: displayChar/listFiles/getFileSize existed only to support File Transfer.
 
 void setup() {
-  // Setup I2C addresses for Wire
+  logInit();   // session log in RTC memory: first, so the reset reason of this boot is in it
+  deepSleepBoot();
+#if WIRSA_FEATURE_MESH
+  meshHeadlessWake();   // a timer wake armed for a background check does it here and sleeps again: no return
+#endif
+  // I2C for Wire
   Wire.begin(OLED_SDA, OLED_SCL);
 
-  // GPIO 15 is an ESP32 strapping pin, regardless of what (if anything) is
-  // wired to it - an undriven/pulled-low GPIO15 can hang the ESP32 at boot.
-  // Configure it as OUTPUT HIGH immediately, before any delays or
-  // peripheral init.
+  // GPIO 15 is an ESP32 strapping pin: an undriven or pulled-low GPIO15 can hang the chip at boot. Drive it OUTPUT HIGH at once, before any delay or peripheral init.
+#if !defined(WIRSA_BOARD_T7S3)   // 15 is the expansion UART TX there
   const int GPIO15_BOOT_SAFETY_PIN = 15;
   pinMode(GPIO15_BOOT_SAFETY_PIN, OUTPUT);
   digitalWrite(GPIO15_BOOT_SAFETY_PIN, HIGH);
+#endif
 
-  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+#if WIRSA_HAS_DISPLAY
+  // SSD1306_SWITCHCAPVCC: generate the display voltage from 3.3 V
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;); // Don't proceed, loop forever
@@ -378,18 +294,19 @@ void setup() {
   delay(2000); // Pause for 2 seconds
   display.clearDisplay();
   display.setCursor(0, 0);     // Start at top-left corner
+#endif
 
-  pinMode(LED_PIN, OUTPUT);
+  ledInit();
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
-  digitalWrite(LED_PIN, HIGH); // off
-  pinMode(SWITCH_PIN, INPUT);
-  digitalWrite(SWITCH_PIN, HIGH);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);   // BOOT button (boot_button.cpp)
+#if !defined(WIRSA_BOARD_T7S3)   // no SW1-4 there (36/37 are PSRAM pins)
   pinMode(SW1_PIN, INPUT);
   pinMode(SW2_PIN, INPUT);
   pinMode(SW3_PIN, INPUT);
   pinMode(SW4_PIN, INPUT);
+#endif
 
   EEPROM.begin(LAST_ADDRESS + 1);
   delay(10);
@@ -399,24 +316,13 @@ void setup() {
   }
 
   readSettings();
-  // Check if it's out of bounds-- we have to be able to talk.
-  // BUG (found while diagnosing a reproducible CalDAV baud-negotiation
-  // failure): sizeof(bauds) is the array's BYTE size (36, sizeof(int)*9),
-  // not its element count (9) - this let serialSpeed values 9..36 through
-  // as "valid", each one an out-of-bounds bauds[] read at both the
-  // PhysicalSerial.begin() below and CDDV_HELLO's own maxAllowed =
-  // bauds[serialSpeed] (caldav_relay.cpp). Whatever garbage memory that
-  // read landed on became the real UART baud rate at boot - every
-  // CDDV_HELLO the Palm sends at the real, hardcoded 9600 idle baud gets
-  // misread as noise against a WiRSa UART actually running at that bogus
-  // rate, deterministically every attempt. (serialSpeed is an unsigned
-  // byte - the `< 0` half of the old check was always false, dead code.)
+  // Out-of-bounds check: we must be able to talk. This fixed a bug found diagnosing a reproducible CalDAV baud-negotiation failure: sizeof(bauds) is the BYTE size (36), not the element count (9),
+  // so serialSpeed 9..36 passed as valid, each an out-of-bounds bauds[] read at PhysicalSerial.begin() below and at CDDV_HELLO's maxAllowed = bauds[serialSpeed] (caldav_relay.cpp). Whatever
+  // memory it hit became the real UART baud at boot, and every CDDV_HELLO the Palm sent at its fixed 9600 idle baud was read as noise, on every attempt. (serialSpeed is unsigned, so the old `< 0` half was dead.)
   if (serialSpeed >= sizeof(bauds) / sizeof(bauds[0])) {
-    serialSpeed = 4; //9600
+    serialSpeed = 0; //9600
   }
-  // Data/parity/stop bits are locked to WIRSA_SERIAL_FORMAT (globals.h) -
-  // no longer a runtime setting, see settingsMenuDisp[]'s dropped
-  // "Serial Config" entry.
+  // Data/parity/stop bits are locked to WIRSA_SERIAL_FORMAT (globals.h), no longer a setting (the "Serial Config" menu entry is gone).
 
   if (dispOrientation==D_NORMAL)
     display.setRotation(0);
@@ -425,80 +331,76 @@ void setup() {
 
  
   Serial.setRxBufferSize(4096);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+  // 4 KB TX buffer: with no monitor attached the ring keeps the most recent output and sends it when one connects.
+  Serial.setTxBufferSize(4096);
+  Serial.begin(115200);  // USB CDC (HWCDC): baud is ignored, no frame format
+  Serial.setTxTimeoutMs(50);
+  // Native USB re-enumerates on every reset and the monitor reopens the port a moment later. Wait for it, but only if a host is there: the cable's SOF frames tell a live host from a charger or a
+  // battery-only board, which get no delay.
+  {
+    bool host = true;
+    for (uint32_t t0 = millis(); millis() - t0 < 60; delay(5))
+      if (!HWCDC::isPlugged()) { host = false; break; }     // settles in a few ms
+    if (host) {
+      for (uint32_t t0 = millis(); !Serial && HWCDC::isPlugged() && millis() - t0 < WIRSA_USB_WAIT_MS; ) delay(10);
+      if (Serial) delay(150);   // let the monitor finish opening
+    }
+  }
+#else
   Serial.begin(115200, SERIAL_8N1); //USB Serial always runs at 115k
-  PhysicalSerial.setRxBufferSize(4096);  // Larger buffer for ZModem transfers (reduces CRC errors from WiFi delays)
-  PhysicalSerial.begin(bauds[serialSpeed], WIRSA_SERIAL_FORMAT, RXD2, TXD2); //Physical Serial
+#endif
+  PhysicalSerial.setRxBufferSize(4096);  // larger buffer for ZModem transfers (fewer CRC errors from WiFi delays)
+  // The menu's rate: 9600 after every boot with the dual-rate menu (the configured baud is then the maximum), else the configured baud.
+  PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT, RXD2, TXD2); //Physical Serial
+
+  // Settle the Palm line: after a reset or a deep-sleep wake (which also runs setup()) it can carry noise, and one stray 'D' would start SASD. Discard everything that arrives for 1.5 s before any key or frame is read.
+  for (uint32_t t0 = millis(); millis() - t0 < 1500; ) {
+    while (PhysicalSerial.available()) PhysicalSerial.read();
+    delay(5);
+  }
 
   SerialPrintLn("");
   SerialPrintLn("-= RetroDisks  WiRSa =-");
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+  Serial.printf("Log level: %s  free heap: %u  PSRAM: %u of %u\r\n",
+                gLogLevel == LOG_OFF ? "off" : gLogLevel == LOG_WARN ? "warn" : gLogLevel == LOG_INFO ? "info" : "verbose", (unsigned) ESP.getFreeHeap(),
+                (unsigned) ESP.getFreePsram(), (unsigned) ESP.getPsramSize());
+#endif
 
-  // Populate mainMenuDisp[]/settingsMenuDisp[] (and their matching mmIdx*/
-  // smIdx* runtime indices) from the WIRSA_FEATURE_* flags - must run
-  // before the first mainMenu(false) below, which reads mainMenuCount.
+  // Fill mainMenuDisp[]/settingsMenuDisp[] (and the mmIdx*/smIdx* indices) from the WIRSA_FEATURE_* flags; must run before the first mainMenu(false) below, which reads mainMenuCount.
   buildMainMenu();
   buildSettingsMenu();
 
   mainMenu(false);
+#if WIRSA_FEATURE_MESH
+  meshBgBoot();
+#endif
 }
 
-/**
-   Arduino main loop function
-*/
+// Arduino main loop
 void loop()
 {
 #if WIRSA_FEATURE_FTPSERVER
-  // FTP server pump runs unconditionally every iteration, independent of
-  // menuMode, so it keeps accepting connections/moving data while the user
-  // is in HotSync/SASD/SLIP Gateway/any other mode - mirrors slip_nat.cpp's
-  // own non-blocking socket idiom (no FreeRTOS tasking anywhere in this
-  // codebase).
+  // The FTP server pump runs every pass whatever menuMode is, so it keeps accepting connections and moving data in HotSync, SASD, SLIP Gateway or any mode (the non-blocking socket idiom of slip_nat.cpp; no FreeRTOS tasks here).
   ftpServerPump();
 #endif
 
-  // Called unconditionally every loop() iteration (same placement as
-  // ftpServerPump() above) so a configured network gets connected and kept
-  // connected regardless of which mode/menu is active. Not feature-gated -
-  // WiFi Setup (Config) is always built.
+  // Every pass (as ftpServerPump()) so a configured network is connected and kept connected in any mode. Not feature-gated: WiFi Setup (Config) is always built.
   maintainWiFi();
 
-  if (menuMode==MODE_MAIN)
-    mainLoop();
-#if WIRSA_FEATURE_HOTSYNC
-  else if (menuMode==MODE_FILE)
-    hotsyncLoop();
+#if WIRSA_FEATURE_BOOT_HOTSYNC && WIRSA_FEATURE_HOTSYNC
+  // BOOT button: HotSync on demand (boot_button.cpp) - one pin read a pass.
+  bootButtonPoll();
 #endif
-#if WIRSA_FEATURE_SASD
-  else if (menuMode==MODE_PLAYBACK)
-    sasdLoop();
+
+  // Dual-rate menu: the second receiver on the Palm RX pin runs in the menus only (palm_ctl.cpp); one state check a pass.
+  deepSleepPoll();
+#if WIRSA_FEATURE_MESH
+  meshBgPoll();
+  meshSpoolPoll();
 #endif
-  else if (menuMode==MODE_SETTINGS)
-    settingsLoop();
-  else if (menuMode==MODE_SETBAUD)
-    baudLoop();
-  else if (menuMode==MODE_ORIENTATION)
-    orientationLoop();
-#if WIRSA_FEATURE_SLIP
-  else if (menuMode==MODE_SLIP)
-    slipLoop();
-#endif
-  else if (menuMode==MODE_WIFI_SETUP)
-    wifiSetupLoop();
-  else if (menuMode==MODE_WIFI_PASSWORD)
-    wifiPasswordLoop();
-#if WIRSA_FEATURE_UTILITIES
-  else if (menuMode==MODE_DIAGNOSTICS)
-    diagnosticsLoop();
-#endif
-#if WIRSA_FEATURE_FTPSERVER
-  else if (menuMode==MODE_FTPSERVER)
-    ftpServerLoop();
-#endif
-#if WIRSA_FEATURE_BITWARDEN
-  else if (menuMode==MODE_BITWARDEN)
-    bitwardenRelayLoop();
-#endif
-#if WIRSA_FEATURE_CALDAV
-  else if (menuMode==MODE_CALDAV_RELAY)
-    caldavRelayLoop();
-#endif
+  palmCtlPoll();
+
+  Modes::runLoop(menuMode);   // the loop of the running mode (modes.h)
 }

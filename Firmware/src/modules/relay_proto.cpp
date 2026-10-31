@@ -3,6 +3,7 @@
 // Originally extracted from bitwarden_relay.cpp's frame I/O layer; both
 // bitwarden_relay.cpp and caldav_relay.cpp now build on this module.
 
+#include "log.h"
 #include "relay_proto.h"
 #include <mbedtls/aes.h>
 #include <mbedtls/rsa.h>
@@ -22,6 +23,7 @@ static bool gRsaReady = false;
 static mbedtls_aes_context gAes;
 static bool gAesInit = false;
 static bool gSecure = false;
+static bool gCtlLink = false;   // Palm control link framing (setControlLink)
 static uint32_t gTxSeq = 0;
 static bool gKexPending = false;
 static uint32_t gKexId = 0;
@@ -123,7 +125,7 @@ void secureBegin() {
               (gKexN[0] & 0x80) != 0;
   if (gRsaReady) computeR3(gKexN, gKexR3);
   else mbedtls_rsa_free(&gRsa);
-  if (usbDebug) Serial.printf("RelayProto: RSA-%u key %s in %lums\r\n", (unsigned) (RSA_BYTES * 8),
+  LOGV("RelayProto: RSA-%u key %s in %lums\r\n", (unsigned) (RSA_BYTES * 8),
                               gRsaReady ? "generated" : "generation FAILED", millis() - t0);
 }
 
@@ -133,6 +135,8 @@ static void sendKexFail(HardwareSerial &io, uint32_t id) {
   writeFrame(io, KEX_FAIL, b, sizeof(b));
 }
 
+static uint32_t gKexReqMs = 0, gKexPubMs = 0;   // timing log: KEX_REQ seen, KEX_PUB sent
+
 bool handleKex(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bodyLen) {
   if (!isKex(type)) return false;
   uint32_t id = bodyLen >= 4 ? be32(body) : 0;
@@ -140,10 +144,11 @@ bool handleKex(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bod
   if (type == KEX_REQ) {
     // A new connection always starts here - drop any previous session.
     secureReset();
+    gKexReqMs = millis();
     if (bodyLen != 4) return true;
     if (!gRsaReady) secureBegin();  // retry a failed boot-time generation
     if (!gRsaReady || mbedtls_ctr_drbg_random(&gDrbg, gKexRand, sizeof(gKexRand)) != 0) {
-      if (usbDebug) Serial.println("RelayProto: KEX_REQ - no key available, sending KEX_FAIL");
+      LOGW("RelayProto: KEX_REQ - no key available, sending KEX_FAIL");
       sendKexFail(io, id);
       return true;
     }
@@ -157,7 +162,9 @@ bool handleKex(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bod
     gKexId = id;
     gKexPending = true;
     writeFrame(io, KEX_PUB, out, sizeof(out));
-    if (usbDebug) Serial.println("RelayProto: KEX_REQ -> KEX_PUB");
+    gKexPubMs = millis();
+    LOGV("RelayProto: KEX_REQ -> KEX_PUB (%lu ms, key %s)\r\n",
+                                (unsigned long) (gKexPubMs - gKexReqMs), gKexPubMs - gKexReqMs > 100 ? "was generated now" : "ready");
     return true;
   }
 
@@ -165,16 +172,17 @@ bool handleKex(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bod
     bool pending = gKexPending;
     gKexPending = false;
     if (!pending || !gRsaReady || bodyLen != 4 + RSA_BYTES || id != gKexId) {
-      if (usbDebug) Serial.println("RelayProto: unexpected KEX_KEY - sending KEX_FAIL");
+      LOGW("RelayProto: unexpected KEX_KEY - sending KEX_FAIL");
       sendKexFail(io, id);
       return true;
     }
     uint8_t secret[16], key[16];
     size_t olen = 0;
+    uint32_t tKey = millis();
     int rc = mbedtls_rsa_pkcs1_decrypt(&gRsa, mbedtls_ctr_drbg_random, &gDrbg, MBEDTLS_RSA_PRIVATE,
                                        &olen, body + 4, secret, sizeof(secret));
     if (rc != 0 || olen != sizeof(secret)) {
-      if (usbDebug) Serial.printf("RelayProto: KEX_KEY decrypt failed (rc=%d len=%u) - sending KEX_FAIL\r\n", rc, (unsigned) olen);
+      LOGW("RelayProto: KEX_KEY decrypt failed (rc=%d len=%u) - sending KEX_FAIL\r\n", rc, (unsigned) olen);
       sendKexFail(io, id);
       return true;
     }
@@ -190,7 +198,8 @@ bool handleKex(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bod
     gSecure = true;
     static const uint8_t ok[4] = {'R', 'P', 'O', 'K'};
     writeFrame(io, KEX_OK, ok, sizeof(ok));  // sent encrypted
-    if (usbDebug) Serial.println("RelayProto: serial link secured");
+    LOGI("RelayProto: serial link secured (Palm took %lu ms from KEX_PUB to KEX_KEY, decrypt %lu ms)\r\n",
+                                (unsigned long) (tKey - gKexPubMs), (unsigned long) (millis() - tKey));
     return true;
   }
 
@@ -211,18 +220,24 @@ bool readFrame(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
                size_t &bodyLen, uint32_t idleTimeoutMs, uint32_t byteTimeoutMs) {
   unsigned long tStart = millis();
   if (!readByte(io, type, idleTimeoutMs)) {
-    if (usbDebug) Serial.printf("RelayProto: no frame-start byte after %lums (idle budget %lums)\r\n",
+    LOGV("RelayProto: no frame-start byte after %lums (idle budget %lums)\r\n",
                                  millis() - tStart, (unsigned long) idleTimeoutMs);
     return false;
   }
+  return readFrameRest(io, type, body, bodyCap, bodyLen, byteTimeoutMs);
+}
+
+bool readFrameRest(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
+                   size_t &bodyLen, uint32_t byteTimeoutMs) {
+  unsigned long tStart = millis();
   uint8_t lenHi, lenLo;
   if (!readByte(io, lenHi, byteTimeoutMs)) {
-    if (usbDebug) Serial.printf("RelayProto: type=0x%02X arrived, then no length byte 1 within %lums\r\n",
+    LOGV("RelayProto: type=0x%02X arrived, then no length byte 1 within %lums\r\n",
                                  type, (unsigned long) byteTimeoutMs);
     return false;
   }
   if (!readByte(io, lenLo, byteTimeoutMs)) {
-    if (usbDebug) Serial.printf("RelayProto: type=0x%02X, then no length byte 2 (total %lums)\r\n",
+    LOGV("RelayProto: type=0x%02X, then no length byte 2 (total %lums)\r\n",
                                  type, millis() - tStart);
     return false;
   }
@@ -240,7 +255,7 @@ bool readFrame(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
   }
 
   if (len > bodyCap) {
-    if (usbDebug) Serial.printf("RelayProto: dropped oversized frame (type=0x%02X len=%u > cap=%u)\r\n",
+    LOGW("RelayProto: dropped oversized frame (type=0x%02X len=%u > cap=%u)\r\n",
                                  type, len, (unsigned) bodyCap);
     uint8_t b;
     for (uint16_t i = 0; i < len; i++) { if (!readByte(io, b, byteTimeoutMs)) return false; }
@@ -250,7 +265,7 @@ bool readFrame(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
 
   for (uint16_t i = 0; i < len; i++) {
     if (!readByte(io, body[i], byteTimeoutMs)) {
-      if (usbDebug) Serial.printf("RelayProto: type=0x%02X len=%u, stalled mid-body at byte %u (total %lums)\r\n",
+      LOGV("RelayProto: type=0x%02X len=%u, stalled mid-body at byte %u (total %lums)\r\n",
                                    type, len, i, millis() - tStart);
       return false;
     }
@@ -258,36 +273,41 @@ bool readFrame(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
   }
   uint8_t rxChk;
   if (!readByte(io, rxChk, byteTimeoutMs)) {
-    if (usbDebug) Serial.printf("RelayProto: type=0x%02X len=%u, body complete but no checksum byte (total %lums)\r\n",
+    LOGV("RelayProto: type=0x%02X len=%u, body complete but no checksum byte (total %lums)\r\n",
                                  type, len, millis() - tStart);
     return false;
   }
   bodyLen = len;
   if (rxChk != chk) {
-    if (usbDebug) Serial.printf("RelayProto: checksum mismatch (type=0x%02X len=%u)\r\n", type, len);
+    LOGW("RelayProto: checksum mismatch (type=0x%02X len=%u)\r\n", type, len);
     return false;
   }
   if (enc) {
     if (!gSecure) {
-      if (usbDebug) Serial.printf("RelayProto: encrypted frame (type=0x%02X) without a session - dropped\r\n", type);
+      LOGW("RelayProto: encrypted frame (type=0x%02X) without a session - dropped\r\n", type);
       return false;
     }
     if (len) xcrypt(body, len, DIR_PALM, be32(seqb), 0);
     type &= (uint8_t) ~ENC_FLAG;
-  } else if (!isKex(type)) {
-    if (usbDebug) Serial.printf("RelayProto: plaintext frame (type=0x%02X) - dropped, link must be secured\r\n", type);
+  } else if (!isKex(type) && !gCtlLink) {
+    LOGW("RelayProto: plaintext frame (type=0x%02X) - dropped, link must be secured\r\n", type);
     return false;
   }
   return true;
 }
 
+void setControlLink(bool on) { gCtlLink = on; }
+bool isSecure() { return gSecure; }
+
 void writeFrame(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bodyLen) {
   // Only the plaintext key-exchange frames go out unencrypted; KEX_OK is
-  // the first encrypted frame of a session.
-  bool enc = !isKex(type) || type == KEX_OK;
+  // the first encrypted frame of a session. On the control link, frames
+  // are also plaintext while the link is not secured.
+  bool enc = (!isKex(type) || type == KEX_OK) && !(gCtlLink && !gSecure && type != KEX_OK);
+  if (gCtlLink) io.write((uint8_t) CTL_LEAD);
   if (enc) {
     if (!gSecure) {
-      if (usbDebug) Serial.printf("RelayProto: frame type=0x%02X not sent - link not secured\r\n", type);
+      LOGW("RelayProto: frame type=0x%02X not sent - link not secured\r\n", type);
       return;
     }
     uint32_t seq = gTxSeq++;
@@ -326,7 +346,7 @@ bool writeFrameAcked(HardwareSerial &io, uint8_t type, const uint8_t *body, size
                       uint8_t *scratchBody, size_t scratchCap,
                       int retries, uint32_t retryDelayMs,
                       uint32_t ackTimeoutMs, uint32_t byteTimeoutMs,
-                      bool *peerSaidBye) {
+                      bool *peerSaidBye, OtherFrameFn onOther) {
   if (peerSaidBye) *peerSaidBye = false;
   for (int attempt = 0; attempt < retries; attempt++) {
     uint8_t ackFrameType; size_t ackLen;
@@ -336,16 +356,27 @@ bool writeFrameAcked(HardwareSerial &io, uint8_t type, const uint8_t *body, size
     // for an already-abandoned attempt must never be misread as this one's).
     while (io.available()) io.read();
     writeFrame(io, type, body, bodyLen);
-    if (usbDebug) Serial.printf("RelayProto: -> frame type=0x%02X len=%u sent, awaiting ack (attempt %d/%d)\r\n",
+    LOGV("RelayProto: -> frame type=0x%02X len=%u sent, awaiting ack (attempt %d/%d)\r\n",
                                  type, (unsigned) bodyLen, attempt + 1, retries);
-    bool gotFrame = readFrame(io, ackFrameType, scratchBody, scratchCap, ackLen, ackTimeoutMs, byteTimeoutMs);
+    bool gotFrame = false;
+    for (;;) {
+      unsigned long used = millis() - tSendStart;
+      uint32_t left = used >= ackTimeoutMs ? 1 : (uint32_t) (ackTimeoutMs - used);
+      gotFrame = readFrame(io, ackFrameType, scratchBody, scratchCap, ackLen, left, byteTimeoutMs);
+      if (gotFrame && ackFrameType != ackType && ackFrameType != byeType && onOther && onOther(ackFrameType, scratchBody, ackLen)) {
+        LOGV("RelayProto: frame type=0x%02X len=%u arrived while awaiting the ack, kept for later\r\n", ackFrameType, (unsigned) ackLen);
+        if (millis() - tSendStart < ackTimeoutMs) continue;      // the ack may still come
+        gotFrame = false;                                         // the time is used up
+      }
+      break;
+    }
     if (!gotFrame || ackFrameType != ackType) {
-      if (usbDebug) {
+      if (logOn(LOG_WARN)) {
         if (gotFrame) {
-          Serial.printf("RelayProto: no ack for frame type=0x%02X after %lums - got a DIFFERENT frame instead: type=0x%02X len=%u\r\n",
+          logPrintf(LOG_WARN, "RelayProto: no ack for frame type=0x%02X after %lums - got a DIFFERENT frame instead: type=0x%02X len=%u\r\n",
                          type, millis() - tSendStart, ackFrameType, (unsigned) ackLen);
         } else {
-          Serial.printf("RelayProto: no ack for frame type=0x%02X after %lums - readFrame itself failed\r\n",
+          logPrintf(LOG_WARN, "RelayProto: no ack for frame type=0x%02X after %lums - readFrame itself failed\r\n",
                          type, millis() - tSendStart);
         }
       }
@@ -355,7 +386,7 @@ bool writeFrameAcked(HardwareSerial &io, uint8_t type, const uint8_t *body, size
       }
       continue;  // genuine timeout/corruption - worth another attempt
     }
-    if (usbDebug) Serial.printf("RelayProto: ack received for type=0x%02X after %lums\r\n", type, millis() - tSendStart);
+    LOGV("RelayProto: ack received for type=0x%02X after %lums\r\n", type, millis() - tSendStart);
     return true;
   }
   return false;

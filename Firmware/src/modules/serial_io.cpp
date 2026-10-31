@@ -2,33 +2,22 @@
 #include "diagnostics.h"
 #include <HardwareSerial.h>
 
-// Global variables (defined in main.cpp)
 extern HardwareSerial PhysicalSerial;
 
-// Binary mode flag - when true, text output is suppressed on PhysicalSerial
-// Used during SLIP/SASD modes where the RS232 port carries binary protocol data
+// Binary mode: when true, text output on PhysicalSerial is suppressed (SLIP and SASD carry binary protocol data on the RS232 port).
 bool binaryModeActive = false;
 
 void setBinaryMode(bool active) {
   binaryModeActive = active;
 }
 
-// Helper to check if we should output to PhysicalSerial
 static inline bool physicalSerialReady() {
   return !binaryModeActive;
 }
 
-// A "telnet console" (consoleClient/consoleConnected, plus the tcpServer it
-// would have come from and ConsoleAvailable/ConsoleRead/ConsolePrint/
-// ConsolePrintLn below) used to be a third output alongside Serial/
-// PhysicalSerial here - removed as genuinely dead: consoleConnected was
-// only ever set false at its own declaration (never true anywhere),
-// consoleClient was never assigned a real connection (nothing ever called
-// tcpServer.accept()/available()/hasClient() to produce one - see
-// network.cpp's own comment on tcpServer itself), and the standalone
-// Console*() functions had zero callers anywhere. Every one of these
-// functions' own consoleReady()-gated branch was unconditionally dead
-// code - confirmed, not assumed.
+// (A "telnet console" was a third output here: consoleClient/consoleConnected, the tcpServer it would have come from, and ConsoleAvailable/ConsoleRead/ConsolePrint/ConsolePrintLn. Removed as dead:
+// consoleConnected was only ever set false at its declaration, consoleClient never got a real connection (nothing called tcpServer.accept()/available()/hasClient(), see network.cpp), and the Console*()
+// functions had no callers, so every consoleReady()-gated branch was unconditionally dead, confirmed not assumed.)
 
 void SerialPrintLn(String s) {
   Serial.println(s);
@@ -168,7 +157,7 @@ int SerialAvailable() {
 }
 
 int SerialRead() {
-  // Priority: USB Serial > Physical Serial
+  // priority: USB Serial, then Physical Serial
   int c = Serial.available();
   if (c > 0) {
     int byte = Serial.read();
@@ -190,7 +179,6 @@ void SerialWrite(int c) {
   if (physicalSerialReady()) PhysicalSerial.write(c);
 }
 
-// Get timestamp in milliseconds as formatted string
 String getTimestamp() {
   unsigned long ms = millis();
   unsigned long sec = ms / 1000;
@@ -206,13 +194,13 @@ String getTimestamp() {
   return String(timestamp);
 }
 
-// USB Debug print with timestamp (only to USB Serial, not PhysicalSerial)
+// USB debug print with a timestamp (USB Serial only)
 void UsbDebugPrint(String s) {
   Serial.print(getTimestamp());
   Serial.print(s);
 }
 
-// USB Debug println with timestamp (only to USB Serial, not PhysicalSerial)
+// USB debug println with a timestamp (USB Serial only)
 void UsbDebugPrintLn(String s) {
   Serial.print(getTimestamp());
   Serial.println(s);

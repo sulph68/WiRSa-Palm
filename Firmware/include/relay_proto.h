@@ -1,14 +1,7 @@
-// relay_proto.h - shared serial frame protocol for WiRSa's relay modes
-// (BitWarden, CalDAV, and any future one). Originally extracted from
-// bitwarden_relay.cpp's frame I/O layer; both existing relays now use it
-// (bitwarden_relay.cpp via thin wrappers), and new relay modes should
-// build on it rather than duplicating the framing/checksum/ack-retry logic.
-//
-// Frame format (identical across every relay mode that uses this):
-//   type(1B) + lenHi(1B) + lenLo(1B) + body(len bytes) + checksum(1B)
-//   checksum = XOR of type, lenHi, lenLo, and every body byte.
-// Big-endian integers, uint16-length-prefixed strings (no NUL) - matches
-// apps/caldav_sync/CDDVWire.c and apps/bitwarden/Wire.c on the Palm side.
+// relay_proto.h - the shared serial frame layer of WiRSa's relay modes (BitWarden, CalDAV, Mesh and any future one), extracted from bitwarden_relay.cpp's frame I/O. New relay modes build on it
+// instead of duplicating the framing, checksum and ack-retry logic.
+// Frame: type (1 B), lenHi, lenLo, body (len bytes), checksum (XOR of type, both length bytes and every body byte). Big-endian integers, uint16-length-prefixed strings (no NUL), as the Palm's
+// apps/caldav_sync/CDDVWire.c and apps/bitwarden/Wire.c. The whole wire is specified in docs/protocol/Protocol-wire.md.
 #ifndef RELAY_PROTO_H
 #define RELAY_PROTO_H
 
@@ -16,86 +9,64 @@
 
 namespace RelayProto {
 
-// Blocking read of a single byte with a real deadline - yields every spin
-// so a long wait (e.g. an idle-frame timeout) never starves WiFi/lwIP/
-// watchdog housekeeping. Returns false on timeout.
+// Blocking read of one byte with a real deadline; yields on every spin so a long wait (an idle-frame timeout) never starves WiFi, lwIP or the watchdog. False on timeout.
 bool readByte(HardwareSerial &io, uint8_t &out, uint32_t timeoutMs);
 
-// Reads one complete frame. idleTimeoutMs bounds the wait for the frame's
-// OWN first byte; byteTimeoutMs bounds the gap between any two bytes once
-// the frame has started. Returns false on timeout, an oversized frame
-// (silently drained, not just rejected - keeps the stream in sync for the
-// next real frame), or a checksum mismatch. Never partial: on true,
-// (type, body[0..bodyLen)) is a fully verified frame.
+// Reads one complete frame. idleTimeoutMs bounds the wait for the frame's own first byte; byteTimeoutMs bounds the gap between bytes once it has started. False on timeout, on an oversized frame
+// (drained, not only rejected, to keep the stream in step) or on a checksum mismatch. Never partial: on true, (type, body[0..bodyLen)) is a fully verified frame.
 bool readFrame(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
                size_t &bodyLen, uint32_t idleTimeoutMs, uint32_t byteTimeoutMs);
 
-// Writes one frame as a single logical unit, then flushes - write() alone
-// only queues into the driver's TX ring buffer; skipping flush() here was
-// a real, confirmed real-hardware bug (BitWarden Relay's own history: the
-// Palm saw zero bytes of the very first acked frame, a clean timeout, not
-// corruption) - mirrors the Palm's own SrmSendWait()-after-every-send
-// convention on the other end of this same link.
+// Writes one frame as a unit, then flushes: write() only queues into the driver's TX ring, and skipping flush() was a hardware bug (the Palm saw no byte of the first acked frame: a clean timeout,
+// not corruption). It mirrors the Palm's SrmSendWait() after every send.
 void writeFrame(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bodyLen);
 
-// Send-and-wait-for-ack with retry, mirroring the Palm's own per-frame
-// ack-retry loop so neither side's patience runs out first. Drains any
-// stale bytes sitting in the RX buffer before each (re)send - a late ack
-// for an already-abandoned attempt would otherwise be misread as the ack
-// for the retried send (both are identical empty-body ack frames).
-// ackType: the frame type that counts as a successful ack.
-// byeType: if the peer sends this INSTEAD of ackType, it has deliberately
-//   ended the session already (own retries exhausted, or user cancelled) -
-//   the retry loop aborts immediately (no point resending into dead air)
-//   and sets *peerSaidBye = true if provided.
-// scratchBody/scratchCap: caller-owned buffer for the ack frame's own body
-//   (discarded either way - every relay's ack frames are empty-body, this
-//   just needs somewhere to read into) - static/module-level, not a stack
-//   local, matching this project's own established caution around
-//   multi-KB buffers on a task stack.
+// Send and wait for the ack, with retry, mirroring the Palm's per-frame ack-retry loop so neither side's patience runs out first. Stale bytes in the RX buffer are drained before each (re)send: a
+// late ack of an abandoned attempt would otherwise pass for the ack of the retry (both are identical empty-body frames).
+// retries/retryDelayMs/ackTimeoutMs: the tries, and the sleep before each retry. ackTimeoutMs is the whole time of one try, so on a retry the sleep is part of it (the ack is awaited ackTimeoutMs - retryDelayMs).
+// ackType: the frame type that counts as the ack.
+// byeType: if the peer sends this INSTEAD of the ack it has ended the session (its retries exhausted, or the user cancelled): the loop aborts at once and sets *peerSaidBye if given.
+// scratchBody/scratchCap: a caller-owned buffer for the ack's body (discarded: acks are empty); static, not on the task stack (multi-KB buffers stay off it).
+// onOther (optional): a frame that is neither the ack nor the BYE arrives while the ack is awaited (the peer sent something of its own at that moment). Without a handler it counts as a failed attempt
+// and the frame is lost; with one, onOther(type, body, len) gets it (body is in scratchBody, valid only during the call: copy it) and returns true if kept, and the wait for the ack goes on.
+using OtherFrameFn = bool (*)(uint8_t type, const uint8_t *body, size_t len);
 bool writeFrameAcked(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bodyLen,
                       uint8_t ackType, uint8_t byeType,
                       uint8_t *scratchBody, size_t scratchCap,
                       int retries, uint32_t retryDelayMs,
                       uint32_t ackTimeoutMs, uint32_t byteTimeoutMs,
-                      bool *peerSaidBye = nullptr);
+                      bool *peerSaidBye = nullptr, OtherFrameFn onOther = nullptr);
 
-// Body encode/decode helpers - uint16-length-prefixed strings, big-endian
-// integers. Both are self-consistent even when truncated/overrun: Writer
-// never writes a length prefix that doesn't match what actually got
-// written (so a truncated field can never desync a receiver mid-frame),
-// and Reader sets ok=false and stops consuming on the first overrun
-// (check .ok after parsing a frame, same convention as the Palm's own
-// CDDVR/BwReader).
-// ---- Serial-link encryption (mandatory, no plaintext fallback) ----------
-// Mirrors the Palm's apps/lib/relaysec.c. Key exchange (plaintext frames):
-//   Palm  -> KEX_REQ  reqId(u32)
-//   WiRSa -> KEX_PUB  reqId(u32) modLen(u16) modulus(big-endian)
-//                     r3(modLen: R^3 mod modulus, R = 2^(8*modLen)) wRand(16)
-//   Palm  -> KEX_KEY  reqId(u32) RSA-PKCS#1-v1.5(secret16)   [e = 3]
-//   WiRSa -> KEX_OK   (encrypted) "RPOK"   or KEX_FAIL reqId(u32)
-// Session key = AES-128-ECB(key = secret, block = wRand). Every other frame
-// is encrypted: wire type = type | ENC_FLAG, wire body = seq(u32) +
-// AES-128-CTR(body), counter block = dir,0,0,0,seq,0..0 (DIR_PALM for
-// Palm->WiRSa, DIR_WIRSA for WiRSa->Palm), checksum over the bytes as sent.
-// readFrame drops any plaintext frame that isn't a key-exchange frame and
-// any encrypted frame without a session; writeFrame refuses to send a
-// non-key-exchange frame without one. The RSA-1024 key pair lives in RAM,
-// generated once per boot (secureBegin); nothing is pinned or stored.
+// Body encode/decode helpers: uint16-length-prefixed strings and big-endian integers, consistent even when truncated or overrun. Writer never writes a length prefix that does not match what was
+// written (a truncated field cannot desync a receiver), and Reader sets ok = false and stops on the first overrun (check .ok after parsing a frame, as the Palm's CDDVR/BwReader).
+// ---- Serial-link encryption (mandatory, no plaintext fallback) ----
+// Mirrors the Palm's apps/lib/relaysec.c; Protocol-wire.md section 4 has the layout. Key exchange in plaintext frames: KEX_REQ (reqId), KEX_PUB (reqId, modLen, modulus, R^3 mod modulus, wRand 16),
+// KEX_KEY (reqId, RSA-PKCS#1-v1.5 of a 16-byte secret, e = 3), then KEX_OK (encrypted, "RPOK") or KEX_FAIL (reqId). Session key = AES-128-ECB(key = secret, block = wRand). Every other frame is
+// encrypted: wire type = type | ENC_FLAG, wire body = seq (u32) + AES-128-CTR(body), counter block = dir, 0, 0, 0, seq, 0..0 (DIR_PALM Palm -> WiRSa, DIR_WIRSA WiRSa -> Palm), checksum over the bytes
+// as sent. readFrame drops a plaintext frame that is not a key-exchange frame and an encrypted one without a session; writeFrame refuses a non-key-exchange frame without a session. The RSA-1024
+// key pair lives in RAM, made once per boot (secureBegin); nothing is pinned or stored.
 enum : uint8_t {
   KEX_REQ = 0x70, KEX_PUB = 0x71, KEX_KEY = 0x72, KEX_OK = 0x73, KEX_FAIL = 0x74,
   ENC_FLAG = 0x80, DIR_PALM = 0x50, DIR_WIRSA = 0x57
 };
 inline bool isKex(uint8_t type) { return (type & 0xF0) == 0x70; }
 
-// Generates the RSA key pair if this boot hasn't yet (call on relay-mode
-// entry - can take a second or two), and clears any session.
+// Makes the RSA key pair if this boot has not (call on relay-mode entry; it can take a second or two) and clears any session.
 void secureBegin();
 // Clears the session (key, sequence, pending exchange).
 void secureReset();
-// Handles a key-exchange frame just returned by readFrame. Returns true if
-// type was a key-exchange type (consumed - the caller skips its dispatch).
+// Handles a key-exchange frame just returned by readFrame. True if type was a key-exchange type (consumed: the caller skips its dispatch).
 bool handleKex(HardwareSerial &io, uint8_t type, const uint8_t *body, size_t bodyLen);
+
+// ---- Palm control link (palm_ctl.cpp) ----
+// Off by default (every relay mode's own behaviour). While on, writeFrame sends CTL_LEAD ahead of every frame, and plaintext non-key-exchange frames are sent and accepted while the link is not
+// secured (only the password commands run secured).
+enum : uint8_t { CTL_LEAD = 0x16 };
+void setControlLink(bool on);
+bool isSecure();
+// readFrame for a caller that already read and checked the type byte.
+bool readFrameRest(HardwareSerial &io, uint8_t &type, uint8_t *body, size_t bodyCap,
+                   size_t &bodyLen, uint32_t byteTimeoutMs);
 
 struct Writer {
   uint8_t *buf; size_t cap; size_t len = 0;

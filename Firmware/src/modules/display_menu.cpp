@@ -1,34 +1,35 @@
-// Display and Menu System Module
-// Handles all display rendering and menu navigation
+// Display rendering and menu navigation
 
 #include "Arduino.h"
 #include "display_menu.h"
+#include "modes.h"
 #include "globals.h"
+#include "sd_mount.h"
+#include "palm_ctl.h"   // menuKey()
 #include "serial_io.h"
 #include "network.h"
+#include "led.h"
 #include "settings.h"
 #include "hotsync.h"
 #include "sasd.h"
+#include "vdisk.h"
 #include "slip_mode.h"
 #include "diagnostics.h"
 #include "wifi_setup.h"
 #include "ftp_server.h"
 #include "bitwarden_relay.h"
 #include "caldav_relay.h"
+#include "mesh_relay.h"
 #include <Adafruit_SSD1306.h>
 #include <SD.h>
 #include <WiFi.h>
 #include <arduino-timer.h>
 
-// dispOrientation_t (D_NORMAL/D_FLIPPED) is defined in main.cpp with no
-// shared header - orientationLoop() (relocated here from modem.cpp) needs
-// its own local copy of the enum to reference the symbolic names, same as
-// modem.cpp itself used to carry locally. The underlying dispOrientation
-// byte variable is separately declared extern below.
+// dispOrientation_t (D_NORMAL/D_FLIPPED) is defined in main.cpp with no shared header; orientationLoop() needs a local copy of the enum for the names. The dispOrientation byte is declared extern below.
 enum dispOrientation_t { D_NORMAL, D_FLIPPED };
 
-// External global variables
-extern Adafruit_SSD1306 display;
+// external globals
+extern WirsaDisplay display;
 extern String baudDisp[];
 extern String mainMenuDisp[];
 extern String settingsMenuDisp[];
@@ -47,17 +48,12 @@ extern const int bauds[];
 extern bool usbDebug;
 extern String build;
 extern unsigned long ledTime;
-extern bool quietMode;
-extern bool verboseResults;
-extern String resultCodes[];
 
-#define BAUDS_COUNT 9
+#define BAUDS_COUNT 7
 
-// WiFi and display graphics
 extern const unsigned char wifi_symbol[];
 
-// Menu mode constants and display modes are #defined in globals.h
-// (MODE_MAIN, MODE_MODEM, etc. and MENU_BOTH, MENU_NUM, MENU_DISP)
+// Menu modes (MODE_MAIN, ...) and display modes (MENU_BOTH, MENU_NUM, MENU_DISP) are in globals.h
 
 String padLeft(String s, int len) {
   while (s.length()<len)
@@ -75,29 +71,21 @@ String padRight(String s, int len) {
   return s;
 }
 
-// Compact "X.Yk" thousands display for a LIVE baud rate (e.g. 9600 -> "9.6k",
-// 57600 -> "57.6k", 300 -> "0.3k") - used by modes whose title needs the live
-// PhysicalSerial.baudRate() (SASD, HotSync - both actively change their own
-// UART rate mid-session) rather than the configured baudDisp[serialSpeed]
-// string every ordinary menu's showHeader() shows. Deliberately uniform
-// (always divide-by-1000, one decimal, always "k") rather than replicating
-// baudDisp[]'s own inconsistent mixed style (plain "9600" but "57.6k") -
-// shorter and predictable at every rate.
+// Compact "X.Yk" for a LIVE baud (9600 -> "9.6k", 57600 -> "57.6k", 300 -> "0.3k"), for titles of modes that show PhysicalSerial.baudRate() (SASD, HotSync change their UART rate mid-session) rather
+// than baudDisp[serialSpeed]. Always divide by 1000, one decimal, "k", instead of baudDisp[]'s mixed style ("9600" but "57.6k"): shorter and predictable.
 String liveBaudStr(uint32_t baud) {
   return String(baud / 1000.0, 1) + "k";
 }
 
 void mainMenu(bool arrow) {
   menuMode=MODE_MAIN;
-  // Internal menu name stays "MAIN" (drives the serial "-=-=- MAIN MENU
-  // -=-=-" banner) - header shows "Main Menu" instead of "WiRSa MAIN",
-  // freeing header room for the WiFi status icon.
+  ledRefresh();   // an RGB LED was dark in a Mesh session: its WiFi colour is back
+  // The internal menu name stays "MAIN" (it drives the serial "-=-=- MAIN MENU -=-=-" banner); the header shows "Main Menu", freeing room for the WiFi status icon.
   showMenu("MAIN", mainMenuDisp, mainMenuCount, (arrow?MENU_DISP:MENU_BOTH), 0, false, "Main Menu");
-  // showHeader() (called by showMenu() above) paints the WiFi status icon
-  // itself as part of every header redraw - no extra call needed here.
+  // showHeader() (called by showMenu() above) paints the WiFi status icon with every header redraw.
 }
 
-//returns true/false depending on if default menu item should be set
+// true if the default menu item should be set
 bool showHeader(String menu, int dispMode, bool showWiRSaPrefix, String displayTitle) {
   bool setDef = false;
 
@@ -107,7 +95,6 @@ bool showHeader(String menu, int dispMode, bool showWiRSaPrefix, String displayT
     SerialPrintLn("-=-=- " + menu + " MENU -=-=-");
   }
 
-  //21 chars wide x 8 lines);
   if (lastMenu != menuMode || msgFlag)
   { //clear the whole display, reset the selction
     msgFlag=false;
@@ -120,11 +107,10 @@ bool showHeader(String menu, int dispMode, bool showWiRSaPrefix, String displayT
     display.drawLine(0,63,127,63,SSD1306_WHITE);
     display.drawLine(0,16,127,16,SSD1306_WHITE);
   } else {
-    //just clear the selection area
+    // just clear the selection area
     display.fillRect(6, 17, 8, 46, SSD1306_BLACK);
   }
 
-  //display.fillRect(0, 0, 127, 9, SSD1306_WHITE);
   display.fillRect(0, 0, 127, 16, SSD1306_WHITE); //fill in the yellow header area
 
   display.drawLine(1, 1, 126, 1, SSD1306_BLACK);  //add an outline to fill this
@@ -133,45 +119,36 @@ bool showHeader(String menu, int dispMode, bool showWiRSaPrefix, String displayT
   display.drawLine(126, 1, 126, 14, SSD1306_BLACK);
 
 
-  //display.drawLine(0,0,0,63,SSD1306_WHITE);
-    //display.setFont(&FreeMono9pt7b);
   display.setCursor(4, 4);     // Start at top-left corner
   display.setTextColor(SSD1306_BLACK); // Draw white text
-  // displayTitle (optional) lets a screen show a friendlier/shorter header
-  // string than its own internal menu name (e.g. diagnosticsMenu() keeps its
-  // "DIAG" menu/serial-banner name but shows "Utilities" here) without
-  // touching menu, which still drives the serial "-=-=- X MENU -=-=-"
-  // banner above and must stay whatever the caller's real menu name is.
+  // displayTitle (optional) shows a friendlier header than the menu's internal name (diagnosticsMenu() keeps "DIAG" for the serial banner but shows "Utilities") without touching menu, which
+  // drives the serial "-=-=- X MENU -=-=-" banner and must stay the caller's real name.
   String titleText = displayTitle.length() ? displayTitle : menu;
   String line = showWiRSaPrefix ? ("WiRSa " + titleText) : titleText;
   display.print(line);
-  String bps = baudDisp[serialSpeed];
+  // The rate the menu runs at now (menuBaud(), palm_ctl.h): 9600 after boot or the Palm's rate with the dual-rate menu, not the configured maximum. Shown in baudDisp[]'s style when it is a table rate.
+  uint32_t now = menuBaud();
+  String bps = liveBaudStr(now);
+  for (int i = 0; i < 9; i++)
+    if ((uint32_t) bauds[i] == now) bps = baudDisp[i];
 
   display.print(padLeft(bps,20-line.length()));
   display.setTextColor(SSD1306_WHITE); // Draw white text
-  //display.setCursor(0, 13);     // Start at top-left corner
   display.setCursor(0, 17);     // Start at top-left corner
-  //display.setFont();
   display.display();
 
-  // Every screen that goes through showHeader() gets the WiFi status icon
-  // here, in the same slot/geometry HotSync/SASD/SLIP/BitWarden's own
-  // custom headers each call this directly for.
+  // Every showHeader() screen gets the WiFi status icon here, in the slot HotSync/SASD/SLIP/BitWarden's custom headers call directly.
   drawWifiStatusIcon();
 
   return setDef;
 }
 
 void showMessage(String message) {
-  //display.fillRect(1, 10, 125, 53, SSD1306_BLACK);
-  //display.drawRect(15, 12, 97, 40, SSD1306_WHITE);
-  //display.fillRect(17, 14, 93, 36, SSD1306_WHITE);
   display.fillRect(1, 17, 125, 44, SSD1306_BLACK);
   display.drawRect(15, 18, 97, 43, SSD1306_WHITE);
   display.fillRect(17, 20, 93, 39, SSD1306_WHITE);
 
   int x = 19;
-  //int y = 16;
   int y = 21;
   int c= 0;
   display.setCursor(x,y);
@@ -209,7 +186,7 @@ void showMenu(String menuName, String options[], int sz, int dispMode, int defau
   if (menuCnt<=maxItems)
     menuEnd=menuCnt;
   else {
-    //clear out menu area
+    // clear the menu area
     display.fillRect(1, 17, 126, 46, SSD1306_BLACK);
 
     menuStart=menuIdx;
@@ -244,9 +221,7 @@ void showMenu(String menuName, String options[], int sz, int dispMode, int defau
         }
       }
       else if (options[i].indexOf('[') >= 0)
-        // Already has an explicit "[X]" shortcut hint authored inline (e.g.
-        // mainMenuDisp's "SAS[D] SDCard", where the real shortcut isn't the
-        // first letter) - print as-is instead of auto-bracketing below.
+        // Already has an explicit "[X]" shortcut hint (mainMenuDisp's "SAS[D] SDCard", where the key is not the first letter): print as is, without auto-bracketing below.
         SerialPrintLn(" " + options[i]);
       else //MENU_BOTH
         SerialPrintLn(" [" + options[i].substring(0,1) + "]" + options[i].substring(1));
@@ -278,11 +253,7 @@ void menuOption(int idx, String item) {
   else
     display.print(" ");
   display.print(" ");
-  // Some menu items (e.g. mainMenuDisp's "SAS[D] SDCard") embed an explicit
-  // "[X]" shortcut-key hint for the serial menu's benefit (see showMenu's
-  // own handling of this) - the OLED gets the same underlying string but
-  // without the bracket clutter, since it's navigated by buttons not
-  // keystrokes.
+  // Some items embed an explicit "[X]" key hint for the serial menu (see showMenu); the OLED gets the string without the brackets, since it is navigated by buttons.
   item.replace("[", "");
   item.replace("]", "");
   display.println(item.substring(0,17));
@@ -290,8 +261,7 @@ void menuOption(int idx, String item) {
 
 void settingsMenu(bool arrow) {
   menuMode = MODE_SETTINGS;
-  // showWiRSaPrefix=false: header reads just "CONFIG" instead of "WiRSa
-  // CONFIG", freeing up room for the WiFi status icon in the header.
+  // showWiRSaPrefix=false: the header reads "CONFIG", not "WiRSa CONFIG", freeing room for the WiFi icon.
   showMenu("CONFIG", settingsMenuDisp, settingsMenuCount, (arrow?MENU_DISP:MENU_BOTH), 0, false);
 }
 
@@ -302,22 +272,16 @@ void orientationMenu(bool arrow) {
 
 void baudMenu(bool arrow) {
   menuMode = MODE_SETBAUD;
-  showMenu("BAUD RATE", baudDisp, 9, (arrow?MENU_DISP:MENU_NUM), serialSpeed);
+#if WIRSA_FEATURE_PALMCTL && WIRSA_FEATURE_DUAL_BAUD
+  showMenu("MAX BAUD RATE", baudDisp, BAUDS_COUNT, (arrow?MENU_DISP:MENU_NUM), serialSpeed);
+#else
+  showMenu("BAUD RATE", baudDisp, BAUDS_COUNT, (arrow?MENU_DISP:MENU_NUM), serialSpeed);
+#endif
 }
 
-// "Start"/"Start (AP Mode)"/"Stop"/"Status" all share the first letter 'S' -
-// showMenu()'s MENU_BOTH serial hint auto-brackets the literal first letter
-// of any item without an explicit "[X]" already embedded, which would
-// otherwise print three misleading "[S]..." hints for keys that don't
-// actually do that action. Same inline-bracket convention mainMenuDisp's own
-// "SAS[D] SDCard" already uses for exactly this reason. The bracketed letter
-// itself is lowercase for "Stop"/"Status" (matches how those letters are
-// naturally cased mid-word - an earlier uppercase choice looked fine in the
-// bracketed serial view but left a stray capital, e.g. "StatUs", once
-// menuOption() strips the brackets for the OLED). "Start"/"AP Mode" keep
-// their capitals since those ARE naturally uppercase there (sentence-start
-// and the "AP" acronym respectively) - case doesn't affect the key match
-// either way (chr=='t'||chr=='T', etc.), purely cosmetic.
+// "Start", "Start (AP Mode)", "Stop" and "Status" all begin with 'S', and showMenu()'s MENU_BOTH serial hint brackets the first letter of any item without an explicit "[X]", which would print
+// three misleading "[S]..." hints. Same inline-bracket convention as "SAS[D] SDCard". The bracketed letter is lowercase for "Stop"/"Status" (naturally cased mid-word; an uppercase one left a stray capital, "StatUs",
+// once menuOption() strips the brackets for the OLED); "Start"/"AP Mode" keep capitals. Case does not affect the key match (chr == 't' || 'T'), only looks.
 String ftpServerMenuDisp[] = { "Main Menu", "[S]tart", "Start ([A]P Mode)", "S[t]op", "Stat[u]s" };
 
 void ftpServerMenu(bool arrow) {
@@ -328,25 +292,21 @@ void ftpServerMenu(bool arrow) {
 
 void readSwitches()
 { // These digital pins are pulled HIGH, pushed=LOW
-  // Restored from original WiRSa.ino for proper button debouncing
+  // restored from the original WiRSa.ino, for button debouncing
+#if WIRSA_HAS_BUTTONS
   BTNUP = !digitalRead(SW1_PIN);
   BTNBK = !digitalRead(SW2_PIN);
   BTNEN = !digitalRead(SW3_PIN);
   BTNDN = !digitalRead(SW4_PIN);
-}
-
-void readBackSwitch()
-{ // Only read BACK button when in active connection (modem mode online)
-  // Prevents interference with connection. All other buttons are disabled.
-  BTNDN = LOW;
-  BTNBK = !digitalRead(SW2_PIN);
-  BTNEN = LOW;
-  BTNUP = LOW;
+#else
+  // Screenless build: no button board, so the INPUT pins would float.
+  BTNUP = BTNBK = BTNEN = BTNDN = false;
+#endif
 }
 
 void waitSwitches()
 {
-  //wait for all switches to be released
+  // wait for all switches to be released
   for (int i=0;i<10;i++) {
     while(BTNDN||BTNBK||BTNEN||BTNUP) {
       delay(10);
@@ -355,115 +315,34 @@ void waitSwitches()
   }
 }
 
-void waitBackSwitch()
-{
-  //wait for all switches to be released
-  for (int i=0;i<10;i++) {
-    while(BTNDN||BTNBK||BTNEN||BTNUP) {
-      delay(10);
-      readBackSwitch();
-    }
-  }
-}
+// Input loops for MODE_MAIN, Baud Rate, Orientation and the Config menu, plus led_on(), relocated from modem.cpp when MODEM mode was removed (none is modem-specific), next to their
+// *Menu() counterparts.
 
-// ============================================================================
-// Relocated from modem.cpp during MODEM mode removal - none of the below are
-// modem-specific. They're the general input-handling loops for MODE_MAIN,
-// Baud Rate, Orientation, and the Config menu itself, plus getLine()/prompt()/
-// led_on() which slip_mode.cpp also depends on via extern declarations.
-// Consolidated here alongside their existing *Menu() counterparts, which
-// already lived in this file. (fileLoop/protocolLoop/listFilesLoop - the
-// Utilities/file-transfer loops this comment used to also cover - were
-// removed along with the rest of file_transfer.cpp/.h, confirmed
-// unreachable from the main menu.)
-// ============================================================================
-
-// Relocated from modem.cpp - genuinely shared with SASD and SLIP Gateway
-// (both send AT-style OK/ERROR result codes over serial), not modem-only
-// despite living there originally. Simplified: modem.cpp's own R_CONNECT/
-// R_NOCARRIER special-casing (which needed connectTimeString(), a real
-// telnet-session concept) is dropped since no surviving caller ever passes
-// those codes - both SASD and SLIP Gateway only ever call sendResult(R_OK_STAT).
-void sendResult(int resultCode) {
-  if (quietMode) return; // ATQ1-style suppression
-  SerialPrint("\r\n");
-  if (verboseResults == 0) {
-    SerialPrintLn(resultCode);
-    return;
-  }
-  SerialPrint(String(resultCodes[resultCode]));
-  SerialPrint("\r\n");
-}
-
-// Relocated from file_transfer.cpp during its removal (XMODEM/YMODEM/ZMODEM
-// file transfer, confirmed unreachable from the main menu) - both are still
-// genuinely used by getLine()/prompt() below, which SLIP Gateway's config
-// prompts (slip_mode.cpp) depend on.
-bool checkCancel() {
-  readBackSwitch();
-  bool cncl = BTNBK;
-  waitBackSwitch();
-  return cncl;
-}
-
-void clearInputBuffer()
-{
-  while (SerialAvailable() > 0)
-  {
-    char discard = SerialRead();
-  }
-}
-
-String getLine()
-{
-  String line="";
-  char c;
-  while (true)
-  {
-    if (checkCancel())
-      return "";
-    if (SerialAvailable() > 0)
-    {
-      c = SerialRead();
-      if (c==13)
-        return line;
-      else if (c==8 || c==127) {
-        if (line.length()>0) {
-          SerialPrint(c);
-          line = line.substring(0, line.length()-1);
-        }
-      }
-      else
-      {
-        SerialPrint(c);
-        line += c;
-      }
-    }
-  }
-}
-
-// Prompt user for input with optional default value
-String prompt(String msg, String dflt)
-{
-  SerialPrintLn("");
-  SerialPrintLn("");
-  SerialPrint(msg);
-  if (dflt!="")
-    SerialPrint("[" + dflt + "] ");
-  showMessage("{SERIAL}\n"+msg);
-  String resp = getLine();
-  if (resp=="")
-    resp = dflt;
-  clearInputBuffer();
-  return resp;
-}
-
-// Turn on the LED and store the time
+// LED on, and remember when
 void led_on()
 {
-  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  ledSet(!ledIsOn());
   ledTime = millis();
 }
+
+#if WIRSA_FEATURE_HOTSYNC
+// HotSync Install from the main menu: the H key and the BOOT button (boot_button.cpp) start it here. Needs the SD card; false (and "PLEASE INSERT SD CARD") without one.
+bool startHotsyncFromMenu()
+{
+  SerialPrintLn("");
+  SerialPrintLn("Initializing the disk...");
+  if (!hotsyncPrepareDisk()) {
+    SerialPrintLn("H) Initialization failed! Please check that SD card is inserted and formatted as FAT16 or FAT32 (or set Disk to the virtual card).");
+    Serial.printf("SD: CS %d SCK %d MOSI %d MISO %d, %lu Hz - check wiring/3.3V; build with -DCORE_DEBUG_LEVEL=1 to see the SD driver's reason\r\n",
+                  (int) SD_CS, (int) SPI_SCK, (int) SPI_MOSI, (int) SPI_MISO, (unsigned long) WIRSA_SD_HZ);
+    showMessage("\nPLEASE INSERT\n   SD CARD");
+    return false;
+  }
+  SerialPrintLn("Initialization Complete.");
+  enterHotsyncMode();
+  return true;
+}
+#endif
 
 void printSDCardInfo() {
   Serial.print("Card type: ");
@@ -490,6 +369,29 @@ void printSDCardInfo() {
   Serial.println(" MB");
 }
 
+#if WIRSA_FEATURE_SASD
+// The D key (and the menu entry): the SASD disk setting (WiRSaCtl Setup) decides what is needed: the virtual card needs no SD card, auto falls back to it when none answers, the SD card setting insists on one.
+void startSasdFromMenu()
+{
+  SerialPrintLn("");
+  bool haveSd = false;
+  if (sasdDiskMode != SASD_DISK_VIRTUAL) {
+    SerialPrintLn("Initializing SD card...");
+    haveSd = sdMount();
+    if (!haveSd && (sasdDiskMode == SASD_DISK_SD || !vdiskPresent())) {
+      SerialPrintLn("D) Initialization failed! Please check that SD card is inserted and formatted as FAT16 or FAT32.");
+      showMessage("\nPLEASE INSERT\n   SD CARD");
+      return;
+    }
+  }
+  if (haveSd) {
+    SerialPrintLn("Initialization Complete.");
+    printSDCardInfo();
+  }
+  enterSasdMode();
+}
+#endif
+
 void mainLoop()
 {
     int menuSel=-1;
@@ -513,106 +415,13 @@ void mainLoop()
     }
     waitSwitches();
 
-    int serAvl = SerialAvailable();
-    char chr;
-    if (serAvl>0)
-      chr = SerialRead();
+    char chr = 0;
+    int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
 
     if (serAvl>0 || menuSel>-1)
     {
-      // Each branch (both the char shortcut AND the menuSel index check) is
-      // wrapped in the SAME WIRSA_FEATURE_* guard as its menu entry
-      // (buildMainMenu(), main.cpp) - a disabled feature's keyboard
-      // shortcut has to disappear along with its menu entry, not just be
-      // hidden from view, or it'd still be reachable by typing the letter
-      // over the USB serial console. mmIdx* (not a literal position) is
-      // what actually still works once some OTHER feature ahead of this one
-      // in the list is compiled out and every later index shifts down.
-#if WIRSA_FEATURE_FTPSERVER
-      if (chr=='F'||chr=='f'||menuSel==mmIdxFtp) //FTP Server
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        ftpServerMenu(false);
-      }
-      else
-#endif
-#if WIRSA_FEATURE_HOTSYNC
-      if (chr=='H'||chr=='h'||menuSel==mmIdxHotsync)   // HotSync Install (repurposed slot - see globals.h)
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        SerialPrintLn("");
-        SerialPrintLn("Initializing SD card...");
-        if (!SD.begin(SD_CS, SPI, 20000000)) {
-          SerialPrintLn("H) Initialization failed! Please check that SD card is inserted and formatted as FAT16 or FAT32.");
-          showMessage("\nPLEASE INSERT\n   SD CARD");
-          return;
-        }
-        SerialPrintLn("Initialization Complete.");
-        printSDCardInfo();
-        enterHotsyncMode();
-      }
-      else
-#endif
-#if WIRSA_FEATURE_SASD
-      if (chr=='D'||chr=='d'||menuSel==mmIdxSasd) // SASD (serial-attached SD)
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        SerialPrintLn("");
-        SerialPrintLn("Initializing SD card...");
-        if (!SD.begin(SD_CS, SPI, 20000000)) {
-          SerialPrintLn("D) Initialization failed! Please check that SD card is inserted and formatted as FAT16 or FAT32.");
-          showMessage("\nPLEASE INSERT\n   SD CARD");
-          return;
-        }
-        SerialPrintLn("Initialization Complete.");
-        printSDCardInfo();
-        enterSasdMode();
-      }
-      else
-#endif
-#if WIRSA_FEATURE_SLIP
-      if (chr=='S'||chr=='s'||menuSel==mmIdxSlip) // SLIP Gateway
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        // Starts the gateway immediately instead of showing the SLIP
-        // submenu first - slipActiveLoop()'s own BACK handler drops back to
-        // slipMenu(false) (the SLIP submenu, not all the way to Main).
-        enterSlipMode();
-      }
-      else
-#endif
-#if WIRSA_FEATURE_BITWARDEN
-      if (chr=='B'||chr=='b'||menuSel==mmIdxBitwarden) // BitWarden Relay
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        enterBitwardenRelayMode();
-      }
-      else
-#endif
-#if WIRSA_FEATURE_CALDAV
-      // 'A' not 'C'/'D' - both already taken (Config, SASD); mainMenuDisp's
-      // own label below carries the "[A]" hint the same way "SAS[D] SDCard"
-      // already does for a non-first-letter hotkey.
-      if (chr=='A'||chr=='a'||menuSel==mmIdxCalDav) // CalDAV Relay
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        enterCalDavRelayMode();
-      }
-      else
-#endif
-#if WIRSA_FEATURE_UTILITIES
-      if (chr=='U'||chr=='u'||menuSel==mmIdxUtilities) // Utilities
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        diagnosticsInit();
-        diagnosticsMenu(false);
-      }
-      else
-#endif
-      if (chr=='C'||chr=='c'||menuSel==mmIdxConfig) // Config - always built, never gated
-      {
-        SerialPrint(chr); //echo it back if it was a valid entry
-        settingsMenu(false);
+      // The main menu's keys and entries come from the mode table (modes.h): a mode that is not built has no row, so its letter over the USB console does nothing either.
+      if (Modes::startFromMenu(chr, menuSel)) {
       }
       else if (chr=='\r'||chr=='\n'||chr=='?')
       {
@@ -650,10 +459,9 @@ void baudLoop()
   }
   waitSwitches();
 
-  int serAvl = SerialAvailable();
-  char chr;
+  char chr = 0;
+  int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
   if (serAvl>0) {
-    chr = SerialRead();
     SerialPrint(chr);
   }
 
@@ -661,21 +469,23 @@ void baudLoop()
   {
     serialSpeed = menuIdx;
     writeSettings();
+    menuBaudReset();   // the menu's session rate, within the new maximum (palm_ctl.h)
     PhysicalSerial.end();
     delay(200);
-    PhysicalSerial.begin(bauds[serialSpeed], WIRSA_SERIAL_FORMAT);
+    PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT);
     settingsMenu(false);
   } else if (serAvl>0) {
-    //between A-I                                or a-i
+    // between A and E, or a and e
     if (chr>=65 && chr <= 65+BAUDS_COUNT-1 || chr>=97 && chr <= 97+BAUDS_COUNT-1)
     {
       if (chr>=97)
         chr -= 32; //convert to uppercase
       serialSpeed = chr-65;
       writeSettings();
+      menuBaudReset();
       PhysicalSerial.end();
       delay(200);
-      PhysicalSerial.begin(bauds[serialSpeed], WIRSA_SERIAL_FORMAT);
+      PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT);
       settingsMenu(false);
     } else
       baudMenu(false);
@@ -707,10 +517,9 @@ void orientationLoop()
   }
   waitSwitches();
 
-  int serAvl = SerialAvailable();
-  char chr;
+  char chr = 0;
+  int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
   if (serAvl>0) {
-    chr = SerialRead();
     SerialPrint(chr);
   }
 
@@ -738,14 +547,9 @@ void orientationLoop()
   }
 }
 
-// Generic blocking character-entry primitive, generalized from
-// wifi_setup.cpp's wifiPasswordMenu()/wifiPasswordLoop() mechanism (same
-// cycle/commit/typed-serial idea) so FTP username/password and AP
-// SSID/password can be entered the same way as WiFi join credentials, via
-// either the OLED+buttons or typed serial. Returns true if the user accepted
-// (long-press EN, or Enter over serial), false if they backed out (BK on an
-// empty buffer). buf must be a caller-owned buffer of at least maxLen+1
-// bytes, pre-populated with the current value (may be empty).
+// A blocking character-entry primitive, generalised from wifi_setup.cpp's wifiPasswordMenu()/wifiPasswordLoop() (cycle, commit, typed serial) so the FTP username/password and AP SSID/password
+// are entered like WiFi credentials, by OLED and buttons or typed serial. True if the user accepted (long-press EN, or Enter over serial), false if they backed out (BK on an empty buffer).
+// buf is caller-owned, at least maxLen+1 bytes, pre-filled with the current value (may be empty).
 static const char CHARENTRY_SET[] = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 static const int CHARENTRY_SET_LEN = sizeof(CHARENTRY_SET) - 1;
 
@@ -763,13 +567,8 @@ static void charEntryDraw(const char *title, char *buf, char currentChar) {
     display.print("<");
   }
   display.print(disp.substring(startPos));
-  // Plain cursor only - the OLED-cycle "next char" preview used to be
-  // appended right here (currentChar + "_"), which looked like a stray
-  // leftover letter stuck on screen for anyone typing over serial instead
-  // (currentChar defaults to 'A' and is never touched by the serial-typing
-  // path, so it always showed as a bogus trailing "A" nobody typed). Moved
-  // to its own labeled spot on the instructions line below instead, where
-  // it can't be mistaken for entered text.
+  // A plain cursor only. The OLED-cycle "next char" preview used to be appended here (currentChar + "_"), which looked like a stray letter for anyone typing over serial (currentChar defaults to 'A'
+  // and the serial path never touches it: a bogus trailing "A"). It has its own labelled spot on the instructions line below.
   display.print("_");
   display.setCursor(3, 49);
   display.print("UD:(");
@@ -780,16 +579,17 @@ static void charEntryDraw(const char *title, char *buf, char currentChar) {
   display.display();
 }
 
-bool charEntryPrompt(const char *title, char *buf, int maxLen) {
+bool charEntryPrompt(const char *title, char *buf, int maxLen, const char *charset) {
+  // charset == NULL: the full printable set, cycling from 'A' (FTP/AP setup). Otherwise only those characters can be cycled to or typed, and cycling starts at the first.
+  const char *set = charset ? charset : CHARENTRY_SET;
+  const int setLen = charset ? (int) strlen(charset) : CHARENTRY_SET_LEN;
   int pos = strlen(buf);
-  char currentChar = 'A';
+  char currentChar = charset ? charset[0] : 'A';
   unsigned long enDownSince = 0;
   unsigned long bkDownSince = 0;
   bool accepted = false;
 
-  // Serial had no announcement at all before this - the OLED showed the
-  // prompt/title, but a serial-only user got no indication of what they
-  // were about to type.
+  // announce the field over serial too (the OLED showed the prompt, a serial-only user got nothing)
   SerialPrintLn("");
   SerialPrintLn(title);
   SerialPrint("> ");
@@ -798,14 +598,7 @@ bool charEntryPrompt(const char *title, char *buf, int maxLen) {
   charEntryDraw(title, buf, currentChar);
 
   while (true) {
-    // This is a self-contained blocking loop (same family as this
-    // codebase's existing getLine()/prompt() helpers) that never returns
-    // control to loop(), so ftpServerPump() would otherwise never run for
-    // however long a human takes to cycle through characters here - likely
-    // much longer than any existing serial-typed prompt() use, since this
-    // one also supports slow OLED button-cycling. Pump explicitly so the
-    // background FTP server keeps serving while the user edits its own
-    // credentials (a realistic thing to do while it's already running).
+    // This blocking loop never returns to loop(), so ftpServerPump() would not run while a person cycles characters: pump explicitly so the FTP server keeps serving while they edit its credentials.
     ftpServerPump();
     readSwitches();
 
@@ -817,7 +610,7 @@ bool charEntryPrompt(const char *title, char *buf, int maxLen) {
       }
     } else {
       if (enDownSince != 0 && millis() - enDownSince <= 800) {
-        // short press: commit current char
+        // short press: commit the current char
         if (pos < maxLen) {
           buf[pos++] = currentChar;
           buf[pos] = '\0';
@@ -827,13 +620,8 @@ bool charEntryPrompt(const char *title, char *buf, int maxLen) {
       enDownSince = 0;
     }
 
-    // Long-press BK cancels immediately regardless of buffer content -
-    // without this, editing a pre-populated field (e.g. an existing saved
-    // FTP username) would require backspacing through the whole existing
-    // value one character at a time before a quick tap finally cancels,
-    // since a short BK only deletes one char at a time. The original
-    // WiFi-join password entry this was generalized from never hit this
-    // case (always starts from an empty buffer), so it never needed this.
+    // Long-press BK cancels at once whatever the buffer holds. Otherwise editing a pre-filled field (an existing FTP username) would need backspacing through the whole value before a tap cancels,
+    // since a short BK deletes one char. The WiFi password entry this came from always starts empty, so never needed it.
     if (BTNBK) {
       if (bkDownSince == 0) bkDownSince = millis();
       if (millis() - bkDownSince > 800) {
@@ -842,7 +630,7 @@ bool charEntryPrompt(const char *title, char *buf, int maxLen) {
       }
     } else {
       if (bkDownSince != 0 && millis() - bkDownSince <= 800) {
-        // short press: backspace one char, or cancel if already empty
+        // short press: backspace one char, or cancel if empty
         if (pos > 0) {
           buf[--pos] = '\0';
           charEntryDraw(title, buf, currentChar);
@@ -855,30 +643,33 @@ bool charEntryPrompt(const char *title, char *buf, int maxLen) {
     }
 
     if (BTNUP) {
-      const char *p = strchr(CHARENTRY_SET, currentChar);
-      int idx = p ? (int)(p - CHARENTRY_SET) : 0;
-      idx = (idx - 1 + CHARENTRY_SET_LEN) % CHARENTRY_SET_LEN;
-      currentChar = CHARENTRY_SET[idx];
+      const char *p = strchr(set, currentChar);
+      int idx = p ? (int)(p - set) : 0;
+      idx = (idx - 1 + setLen) % setLen;
+      currentChar = set[idx];
       charEntryDraw(title, buf, currentChar);
       delay(150);
     } else if (BTNDN) {
-      const char *p = strchr(CHARENTRY_SET, currentChar);
-      int idx = p ? (int)(p - CHARENTRY_SET) : 0;
-      idx = (idx + 1) % CHARENTRY_SET_LEN;
-      currentChar = CHARENTRY_SET[idx];
+      const char *p = strchr(set, currentChar);
+      int idx = p ? (int)(p - set) : 0;
+      idx = (idx + 1) % setLen;
+      currentChar = set[idx];
       charEntryDraw(title, buf, currentChar);
       delay(150);
     }
 
-    // Typed-string entry over either serial port, same as WiFi password entry
+    // typed-string entry over either serial port, as WiFi password entry
     if (SerialAvailable() > 0) {
       char c = SerialRead();
       if (c == 13) { // Enter accepts
         accepted = true;
         break;
+      } else if (c == 0x1B || c == 0x16) {
+        // ESC cancels (the only way out without a BACK button). 0x16 starts a Palm control frame (palm_ctl.cpp): cancel instead of typing its bytes into the field (the menu's burst guard drains the rest).
+        break;
       } else if (c == 8 || c == 127) {
         if (pos > 0) { buf[--pos] = '\0'; SerialPrint(c); }
-      } else if (c >= 32 && c < 127) {
+      } else if (c >= 32 && c < 127 && (!charset || strchr(charset, c))) {
         if (pos < maxLen) { buf[pos++] = c; buf[pos] = '\0'; SerialPrint(c); }
       }
       charEntryDraw(title, buf, currentChar);
@@ -887,6 +678,45 @@ bool charEntryPrompt(const char *title, char *buf, int maxLen) {
 
   waitSwitches();
   return accepted;
+}
+
+// One Exit Timers value (mode_timer.h), seconds 0-255, 0 = never.
+static void editExitTimer(const char *title, uint8_t &value)
+{
+  char buf[4];
+  snprintf(buf, sizeof(buf), "%u", (unsigned) value);
+  if (charEntryPrompt(title, buf, 3, "0123456789")) {
+    long v = atol(buf);
+    if (v > 255) v = 255;
+    value = (uint8_t) v;
+  }
+}
+
+// Factory Reset always asks first. Buttons: ENTER confirms, BACK cancels. Typed (F): the next key must be Y, read through menuKey() so a burst of stray bytes cannot confirm. No answer in 15 s cancels.
+static bool confirmFactoryReset(bool byButton)
+{
+  if (byButton) {
+    showMessage("FACTORY RESET?\n\nENTER: Confirm\nBACK: Cancel");
+    waitSwitches();
+    while (true) {
+      readSwitches();
+      if (BTNEN) { waitSwitches(); return true; }
+      if (BTNBK) { waitSwitches(); return false; }
+      delay(50);
+    }
+  }
+  SerialPrintLn("\r\nFactory reset? Press Y to confirm, any other key to cancel.");
+  showMessage("FACTORY RESET?\n\nY: Confirm\nOther key: Cancel");
+  unsigned long t0 = millis();
+  while (millis() - t0 < 15000) {
+    char k = 0;
+    if (menuKey(k)) {
+      SerialPrint(k);
+      return k == 'Y' || k == 'y';
+    }
+    delay(10);
+  }
+  return false;
 }
 
 // Settings (Config) menu loop
@@ -911,10 +741,9 @@ void settingsLoop()
   }
   waitSwitches();
 
-  int serAvl = SerialAvailable();
-  char chr;
+  char chr = 0;
+  int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
   if (serAvl>0) {
-    chr = SerialRead();
     SerialPrint(chr);
   }
 
@@ -945,7 +774,7 @@ void settingsLoop()
       }
       settingsMenu(false);
     }
-    else if (chr=='P'||chr=='p'||menuSel==smIdxApSetup) // AP Setup (P for "aP") - only used by FTP Server's own AP-mode fallback, gated with it
+    else if (chr=='P'||chr=='p'||menuSel==smIdxApSetup)  // AP Setup (P for "aP"), used only by FTP Server's AP-mode fallback, gated with it
     {
       char ssidBuf[AP_SSID_MAX+1];
       char passBuf[AP_PASS_MAX+1];
@@ -961,6 +790,13 @@ void settingsLoop()
       settingsMenu(false);
     }
 #endif
+#if WIRSA_FEATURE_SLIP
+    else if (chr=='S'||chr=='s'||menuSel==smIdxSlipSetup) // SLIP Setup - gateway/client/DNS addresses
+    {
+      slipSetup();
+      settingsMenu(false);
+    }
+#endif
     else if (chr=='B'||chr=='b'||menuSel==smIdxBaud)
     {
       baudMenu(false);
@@ -971,19 +807,44 @@ void settingsLoop()
     }
     else if (chr=='U'||chr=='u'||menuSel==smIdxUsbDebug)
     {
-      usbDebug = !usbDebug;
+      // off, warn, info, verbose, off
+      logSetLevel(gLogLevel >= LOG_VERBOSE ? LOG_OFF : gLogLevel + 1);
       writeSettings();
-      SerialPrintLn(usbDebug ? "USB Debug: ENABLED" : "USB Debug: DISABLED");
-      showMessage(usbDebug ? "USB Debug\n\nENABLED" : "USB Debug\n\nDISABLED");
+      const char *lv = gLogLevel == LOG_OFF ? "OFF" : gLogLevel == LOG_WARN ? "WARN" : gLogLevel == LOG_INFO ? "INFO" : "VERBOSE";
+      SerialPrintLn(String("USB Debug: ") + lv);
+      showMessage(String("USB Debug\n\n") + lv);
       delay(1500);  // Pause so the message can be read on the display
+      settingsMenu(false);
+    }
+    else if (chr=='E'||chr=='e'||menuSel==smIdxExitTimers)  // Exit Timers: when HotSync/CalDAV/Bitwarden go back to the main menu
+    {
+      editExitTimer("Unused mode exit\n(seconds, 0=never)", modeUnusedExitSec);
+      editExitTimer("After session exit\n(seconds, 0=never)", modeAfterExitSec);
+      {
+        uint8_t m = slipTimeoutMin;
+        editExitTimer("SLIP timeout (min)\n1, 2, 3 or 5", m);
+        if (slipTimeoutValid(m)) slipTimeoutMin = m;
+      }
+      {
+        uint8_t m = sasdTimeoutMin;
+        editExitTimer("SASD timeout (min)\n3, 5, 10 or 15", m);
+        if (sasdTimeoutValid(m)) sasdTimeoutMin = m;
+      }
+      writeSettings();
+      SerialPrintLn("\r\nExit timers: unused " + String(modeUnusedExitSec) + " s, after session " + String(modeAfterExitSec) + " s, SLIP " + String(slipTimeoutMin) + " min");
       settingsMenu(false);
     }
     else if (chr=='F'||chr=='f'||menuSel==smIdxFactoryReset)
     {
-       SerialPrintLn("** PLEASE WAIT: FACTORY RESET **");
-       showMessage("***************\n* PLEASE WAIT *\n*FACTORY RESET*\n***************");
-       defaultEEPROM();
-       ESP.restart();
+      if (confirmFactoryReset(menuSel == smIdxFactoryReset)) {
+        SerialPrintLn("** PLEASE WAIT: FACTORY RESET **");
+        showMessage("***************\n* PLEASE WAIT *\n*FACTORY RESET*\n***************");
+        defaultEEPROM();
+        ESP.restart();
+      }
+      SerialPrintLn("\r\nFactory reset cancelled.");
+      msgFlag = true;
+      settingsMenu(false);
     }
     else if (chr=='R'||chr=='r'||menuSel==smIdxReboot)
     {
@@ -1029,10 +890,9 @@ void ftpServerLoop()
   }
   waitSwitches();
 
-  int serAvl = SerialAvailable();
-  char chr;
+  char chr = 0;
+  int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
   if (serAvl>0) {
-    chr = SerialRead();
     SerialPrint(chr);
   }
 
@@ -1045,12 +905,8 @@ void ftpServerLoop()
     else if (chr=='S'||chr=='s'||menuSel==1) // Start
     {
       ftpServerStart(false);
-      // Force the full-clear redraw path: menuMode doesn't change (we're
-      // already MODE_FTPSERVER), so showHeader()'s own lastMenu-unchanged
-      // fast path would otherwise skip clearing before the Status line's
-      // text is redrawn - menuOption() never clears its own row (relies on
-      // the caller having done so), so an old and new string of different
-      // pixel width would leave stale glyph fragments behind.
+      // Force the full-clear redraw: menuMode does not change (already MODE_FTPSERVER), so showHeader()'s lastMenu-unchanged fast path would skip clearing before the Status text is redrawn, and
+      // menuOption() never clears its row, so an old and new string of different pixel width would leave stale glyph fragments.
       msgFlag = true;
       ftpServerMenu(false);
     }

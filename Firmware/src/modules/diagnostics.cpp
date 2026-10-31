@@ -1,18 +1,18 @@
-// Diagnostics Module
-// Serial diagnostics and troubleshooting tools for WiRSa
+// Diagnostics: serial diagnostics and troubleshooting tools
 
 #include "Arduino.h"
 #include "diagnostics.h"
 #include "globals.h"
+#include "palm_ctl.h"   // menuKey()
 #include "display_menu.h"
 #include "serial_io.h"
 #include "settings.h"
 #include "network.h"
+#include "battery.h"
 #include <WiFi.h>
 #include <Adafruit_SSD1306.h>
 
-// External globals
-extern Adafruit_SSD1306 display;
+extern WirsaDisplay display;
 extern int menuMode;
 extern int menuIdx;
 extern int menuCnt;
@@ -21,37 +21,30 @@ extern byte serialSpeed;
 extern const int bauds[];
 extern HardwareSerial PhysicalSerial;
 extern String build;
+extern String ssid, password;
 
-// Button state
 extern bool BTNUP;
 extern bool BTNDN;
 extern bool BTNEN;
 extern bool BTNBK;
 
-// Menu display array (defined in main.cpp)
+// menu display array (defined in main.cpp)
 extern String diagnosticsMenuDisp[];
 
-// Diagnostics context
 DiagnosticsContext diagCtx;
 
 void diagnosticsInit() {
   diagCtx.hexDumpEnabled = false;
 }
 
-// ============================================================================
-// Hex Dump Mode
-// ============================================================================
-//
-// diagCtx.hexDumpEnabled has no remaining writer (setHexDumpMode, its only
-// one, was AT$HEX-only and removed with the rest of the dead AT-command
-// dispatcher below) - permanently false, so hexDumpByte's real call sites
-// (serial_io.cpp) are now unconditionally inert. Left in place rather than
-// also touching serial_io.cpp's RX/TX hot path in this same pass.
+// ---- Hex Dump Mode ----
+// diagCtx.hexDumpEnabled has no writer left (setHexDumpMode was AT$HEX-only and went with the dead AT dispatcher), so it is permanently false and hexDumpByte's call sites (serial_io.cpp) are inert.
+// Left in place rather than touch serial_io.cpp's RX/TX hot path in the same pass.
 
 void hexDumpByte(char direction, uint8_t byte) {
   if (!diagCtx.hexDumpEnabled) return;
 
-  // Format: [T] 41 'A'  or  [R] 0D <CR>
+  // format: [T] 41 'A'  or  [R] 0D <CR>
   Serial.print("[");
   Serial.print(direction);
   Serial.print("] ");
@@ -60,7 +53,6 @@ void hexDumpByte(char direction, uint8_t byte) {
   Serial.print(byte, HEX);
   Serial.print(" ");
 
-  // Show ASCII or control char name
   if (byte >= 0x20 && byte < 0x7F) {
     Serial.print("'");
     Serial.print((char)byte);
@@ -87,13 +79,13 @@ void hexDumpByte(char direction, uint8_t byte) {
   }
 }
 
-// ============================================================================
-// Information Screen (Utilities menu) - HotSync/BitWarden-style boxed
-// header + scrollable status area, reflowed into a scrollable line list
-// sized for the OLED's status area.
-// ============================================================================
+// ---- Information screen (Utilities menu): a HotSync/BitWarden-style boxed header and a scrollable status area, reflowed into a line list sized for the OLED's status area. ----
 
+#if defined(BATTERY_PIN)
+#define INFO_MAX_LINES 12    // + the battery line
+#else
 #define INFO_MAX_LINES 11
+#endif
 #define INFO_VISIBLE_LINES 4  // status area is 47px tall / 10px per row
 
 static String infoLines[INFO_MAX_LINES];
@@ -116,6 +108,9 @@ static void infoBuildLines() {
   String up = days > 0 ? (String(days) + "d " + String(hours) + "h")
                         : (String(hours) + "h " + String(mins) + "m " + String(secs) + "s");
   infoLines[infoLineCount++] = "Up: " + up;
+#if defined(BATTERY_PIN)
+  infoLines[infoLineCount++] = batteryInfoLine();
+#endif
 
   if (WiFi.status() == WL_CONNECTED) {
     infoLines[infoLineCount++] = "WiFi: " + WiFi.SSID();
@@ -126,11 +121,11 @@ static void infoBuildLines() {
     infoLines[infoLineCount++] = "WiFi: Not connected";
   }
 
-  infoLines[infoLineCount++] = "Baud: " + String(bauds[serialSpeed]);
+  infoLines[infoLineCount++] = "Baud: " + String(bauds[serialSpeed]) +
+    (menuBaud() != (uint32_t) bauds[serialSpeed]   // dual-rate menu swapped (palm_ctl.h)
+       ? " now " + String(menuBaud()) : String(""));   // "Baud: 115200 now 9600" = 21 chars
 
-  // Defensive truncate - one line is ~21 chars wide before the default font
-  // would wrap it onto the next display row and throw off the fixed 10px
-  // row spacing below (mainly a concern for long WiFi SSIDs).
+  // Defensive truncate: a line is ~21 chars before the default font wraps it onto the next row and breaks the fixed 10 px spacing (mainly long WiFi SSIDs).
   for (int i = 0; i < infoLineCount; i++) {
     if (infoLines[i].length() > 21) infoLines[i] = infoLines[i].substring(0, 21);
   }
@@ -145,8 +140,7 @@ static void infoDrawHeader() {
 
   display.setCursor(4, 4);
   display.setTextColor(SSD1306_BLACK);
-  // Live baud top-right, same as hotsync.cpp's hsDrawHeader()/bitwarden_
-  // relay.cpp's bwDrawHeader() - every title bar shows the active baud rate.
+  // Live baud top right, as hotsync.cpp's hsDrawHeader() and bitwarden_relay.cpp's bwDrawHeader(): every title bar shows the active rate.
   {
     String line = "Information";
     display.print(line);
@@ -169,7 +163,7 @@ static void infoDrawStatus() {
     y += 10;
   }
 
-  // Same up/down scroll-indicator glyphs showMenu() uses for a long list.
+  // the up/down scroll glyphs showMenu() uses for a long list
   if (infoScrollOffset > 0) {
     display.setCursor(120, 19);
     display.write(0x1E);
@@ -222,27 +216,17 @@ void showInformationScreen() {
     delay(20);
   }
 
-  // menuMode never left MODE_DIAGNOSTICS while this screen was up (it draws
-  // directly via infoDrawHeader()/infoDrawStatus(), bypassing showMenu()),
-  // so showHeader()'s own lastMenu!=menuMode check wouldn't trigger a full
-  // clearDisplay() on the way back in - it'd only repaint the small
-  // selection-arrow strip, leaving this screen's scrollable text/arrows
-  // behind as garbage. Force it, same idiom sasd.cpp/slip_mode.cpp already
-  // use for their own custom full-screen status views.
+  // menuMode never left MODE_DIAGNOSTICS while this screen was up (it draws with infoDrawHeader()/infoDrawStatus(), bypassing showMenu()), so showHeader()'s lastMenu != menuMode check would not
+  // clear the display on the way back, and the screen's text and arrows would stay as garbage. Force it, as sasd.cpp and slip_mode.cpp do for their custom full-screen views.
   lastMenu = -1;
   diagnosticsMenu(false);  // BACK returns to Utilities
 }
 
-// ============================================================================
-// Diagnostics Menu and Loop
-// ============================================================================
+// ---- Diagnostics menu and loop ----
 
 void diagnosticsMenu(bool arrow) {
   menuMode = MODE_DIAGNOSTICS;
-  // Internal menu name stays "DIAG" (drives the serial "-=-=- DIAG MENU
-  // -=-=-" banner) - header shows "Utilities" instead to match the
-  // main-menu item that leads here, and to free up room for the WiFi
-  // status icon.
+  // The internal menu name stays "DIAG" (it drives the serial "-=-=- DIAG MENU -=-=-" banner); the header shows "Utilities" to match the main-menu item that leads here and to free room for the WiFi icon.
   showMenu("DIAG", diagnosticsMenuDisp, 3, (arrow ? MENU_DISP : MENU_BOTH), 0, false, "Utilities");
 }
 
@@ -269,28 +253,38 @@ void diagnosticsLoop() {
   }
   waitSwitches();
 
-  // Serial input
-  int serAvl = SerialAvailable();
   char chr = 0;
+  int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
   if (serAvl > 0) {
-    chr = SerialRead();
     SerialPrint(chr);
   }
 
-  // Handle selection
   if (serAvl > 0 || menuSel > -1) {
     if (chr == 'M' || chr == 'm' || menuSel == 0) {
-      // Main Menu - matches the 'M'/'m' convention every other menu that
-      // returns straight to mainMenu() uses (settingsMenuDisp/
-      // ftpServerMenuDisp/slipMenuDisp), instead of the 'B'/'b' this menu
-      // used to share with menus that only go back one level to a
-      // submenu.
+      // Main Menu: the 'M'/'m' convention of the other menus that return straight to mainMenu() (settingsMenuDisp, ftpServerMenuDisp), not the 'B'/'b' this menu used to share with menus that go back one level.
       mainMenu(false);
     }
     else if (chr == 'R' || chr == 'r' || menuSel == 1) {
-      // Retry WiFi - manual kick for maintainWiFi()'s background reconnect,
-      // which gives up retrying after one grace window and needs an
-      // explicit restart rather than a reboot.
+      // Retry WiFi: a manual kick for maintainWiFi()'s background reconnect, which gives up after one grace window and needs an explicit restart, not a reboot.
+      // USB only: what is saved, and does the radio see that SSID at all
+      if (ssid == "" || password == "") {
+        Serial.printf("\r\nWiFi: NOTHING TO RETRY - saved SSID %s, password %s\r\n",
+                      ssid == "" ? "is empty" : "set", password == "" ? "is empty" : "set");
+      } else {
+        Serial.printf("\r\nWiFi: saved SSID \"%s\" (%u chars), password %u chars - scanning...\r\n",
+                      ssid.c_str(), (unsigned) ssid.length(), (unsigned) password.length());
+        int n = WiFi.scanNetworks();
+        bool seen = false;
+        for (int i = 0; i < n; i++) {
+          if (WiFi.SSID(i) == ssid) {
+            seen = true;
+            Serial.printf("WiFi: seen on channel %d, RSSI %d dBm, auth type %d\r\n",
+                          (int) WiFi.channel(i), (int) WiFi.RSSI(i), (int) WiFi.encryptionType(i));
+          }
+        }
+        if (!seen) Serial.printf("WiFi: SSID NOT seen in %d networks found (2.4 GHz only; check spelling/case)\r\n", n);
+        WiFi.scanDelete();
+      }
       retryWiFi();
       SerialPrintLn("\r\nWiFi: retrying connection to saved SSID...");
       showMessage("WiFi\n\nRetrying...");
@@ -298,8 +292,7 @@ void diagnosticsLoop() {
       diagnosticsMenu(false);
     }
     else if (chr == 'I' || chr == 'i' || menuSel == 2) {
-      // Information - own scrollable screen, handles its own BACK-to-
-      // Utilities exit internally (see showInformationScreen()).
+      // Information: its own scrollable screen, which handles its BACK to Utilities itself (see showInformationScreen()).
       showInformationScreen();
     }
     else if (serAvl > 0) {

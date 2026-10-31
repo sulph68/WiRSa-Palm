@@ -1,19 +1,12 @@
-// ============================================================================
-// SLIP Protocol Implementation (RFC 1055)
-// ============================================================================
-// Serial Line Internet Protocol - simple framing for IP packets over serial
-// ============================================================================
+// SLIP (RFC 1055): simple framing of IP packets over serial
 
 #include "slip.h"
 #include "globals.h"
 #include "serial_io.h"
 
-// Debug support
 extern bool usbDebug;
 
-// ============================================================================
-// Initialize SLIP Context
-// ============================================================================
+// ---- initialise the SLIP context ----
 
 void slipInit(SlipContext* ctx) {
     ctx->rxState = SLIP_RX_IDLE;
@@ -27,51 +20,41 @@ void slipInit(SlipContext* ctx) {
     ctx->bytesSent = 0;
 }
 
-// ============================================================================
-// Receive SLIP-encoded byte
-// ============================================================================
-// Process one byte at a time from serial input
-// Returns: 0 = continue receiving
-//          >0 = complete frame length (data in rxBuffer)
+// ---- receive a SLIP-encoded byte ----
+// One byte at a time from serial input. Returns 0 to keep receiving, or the frame length (> 0) when a frame is complete (data in rxBuffer).
 
 int slipReceiveByte(SlipContext* ctx, uint8_t byte) {
     ctx->bytesReceived++;
 
     switch (ctx->rxState) {
         case SLIP_RX_IDLE:
-            // Waiting for frame start
             if (byte == SLIP_END) {
-                // Start of frame (or empty frame delimiter)
                 ctx->rxPos = 0;
                 ctx->rxState = SLIP_RX_RECEIVING;
             }
-            // Ignore any other bytes while idle (line noise)
+            // other bytes while idle are line noise: ignore
             return 0;
 
         case SLIP_RX_RECEIVING:
             if (byte == SLIP_END) {
-                // End of frame
                 if (ctx->rxPos > 0) {
-                    // Valid frame received
                     ctx->framesReceived++;
                     int len = ctx->rxPos;
                     ctx->rxState = SLIP_RX_IDLE;
-                    // Don't reset rxPos - caller needs the data
+                    // rxPos is not reset: the caller needs the data
                     return len;
                 }
-                // Empty frame (consecutive ENDs) - stay receiving
+                // empty frame (consecutive ENDs): keep receiving
                 ctx->rxPos = 0;
                 return 0;
             } else if (byte == SLIP_ESC) {
-                // Escape sequence starting
                 ctx->rxState = SLIP_RX_ESCAPE;
                 return 0;
             } else {
-                // Regular data byte
                 if (ctx->rxPos < SLIP_BUFFER_SIZE) {
                     ctx->rxBuffer[ctx->rxPos++] = byte;
                 } else {
-                    // Buffer overflow - discard frame
+                    // buffer overflow: discard the frame
                     ctx->rxErrors++;
                     ctx->rxState = SLIP_RX_IDLE;
                     ctx->rxPos = 0;
@@ -80,26 +63,21 @@ int slipReceiveByte(SlipContext* ctx, uint8_t byte) {
             }
 
         case SLIP_RX_ESCAPE:
-            // Process escaped byte
             ctx->rxState = SLIP_RX_RECEIVING;
 
             if (byte == SLIP_ESC_END) {
-                // Escaped END -> store actual END character
                 byte = SLIP_END;
             } else if (byte == SLIP_ESC_ESC) {
-                // Escaped ESC -> store actual ESC character
                 byte = SLIP_ESC;
             } else {
-                // Invalid escape sequence - protocol error
-                // RFC 1055 suggests storing the byte anyway, but we'll flag error
+                // Invalid escape sequence, a protocol error: RFC 1055 suggests storing the byte anyway, but flag the error
                 ctx->rxErrors++;
-                // Continue anyway - some implementations may have quirks
+                // carry on: some implementations have quirks
             }
 
             if (ctx->rxPos < SLIP_BUFFER_SIZE) {
                 ctx->rxBuffer[ctx->rxPos++] = byte;
             } else {
-                // Buffer overflow
                 ctx->rxErrors++;
                 ctx->rxState = SLIP_RX_IDLE;
                 ctx->rxPos = 0;
@@ -110,58 +88,103 @@ int slipReceiveByte(SlipContext* ctx, uint8_t byte) {
     return 0;
 }
 
-// ============================================================================
-// Send SLIP-encoded frame
-// ============================================================================
-// Takes raw IP packet data and sends it with SLIP framing to PhysicalSerial
+// ---- pacing ----
+static uint32_t sPaceLine = 0, sPaceRate = 0, sPaceMin = 0, sPaceAcked = 0, sPaceBackoffs = 0;
+static unsigned long sPaceLastBackoffMs = 0;
+static uint32_t sPaceNextUs = 0;
 
-void slipSendFrame(SlipContext* ctx, const uint8_t* data, uint16_t length) {
-    if (usbDebug) {
-        UsbDebugPrint("");
-        Serial.printf("SLIP: Sending frame, %d bytes\r\n", length);
-    }
-
-    // RFC 1055 recommends sending END at start to flush any line noise
-    // This also serves as frame delimiter for back-to-back frames
-    PhysicalSerial.write(SLIP_END);
-    ctx->bytesSent++;
-
-    // Send data with escaping
-    for (uint16_t i = 0; i < length; i++) {
-        switch (data[i]) {
-            case SLIP_END:
-                // END character in data must be escaped
-                PhysicalSerial.write(SLIP_ESC);
-                PhysicalSerial.write(SLIP_ESC_END);
-                ctx->bytesSent += 2;
-                break;
-
-            case SLIP_ESC:
-                // ESC character in data must be escaped
-                PhysicalSerial.write(SLIP_ESC);
-                PhysicalSerial.write(SLIP_ESC_ESC);
-                ctx->bytesSent += 2;
-                break;
-
-            default:
-                // Regular byte - send as-is
-                PhysicalSerial.write(data[i]);
-                ctx->bytesSent++;
-                break;
-        }
-    }
-
-    // End frame
-    PhysicalSerial.write(SLIP_END);
-    ctx->bytesSent++;
-
-    ctx->framesSent++;
+void slipPaceInit(uint32_t lineBaud) {
+    sPaceLine = lineBaud;
+    sPaceRate = lineBaud;
+    // Pacing is only for the fast rates: at 57600 and below the Palm keeps up, and a timeout there is usually a damaged acknowledgement on the Palm's own line, which slowing down does not cure
+    // (measured: 40 s unpaced, 60 s or more paced).
+    sPaceMin = lineBaud > 57600 ? lineBaud / 5 : lineBaud;
+    sPaceAcked = 0;
+    sPaceBackoffs = 0;
+    sPaceLastBackoffMs = 0;
+    sPaceNextUs = micros();
 }
 
-// ============================================================================
-// Reset SLIP receiver state
-// ============================================================================
-// Called after timeout or error to resync with incoming data
+void slipPaceBackoff() {
+    if (!sPaceLine) return;
+    // one step per burst of losses: a window of lost segments is one event, not several
+    if (sPaceLastBackoffMs && millis() - sPaceLastBackoffMs < 500) return;
+    sPaceLastBackoffMs = millis();
+    if (sPaceMin >= sPaceLine) return;        // pacing is off at this line speed
+    sPaceBackoffs++;
+    sPaceRate = sPaceRate - sPaceRate / 4;
+    if (sPaceRate < sPaceMin) sPaceRate = sPaceMin;
+    sPaceAcked = 0;
+}
+
+void slipPaceAcked(uint32_t bytes) {
+    if (!sPaceLine || sPaceRate >= sPaceLine) return;
+    sPaceAcked += bytes;
+    if (sPaceAcked >= 4096 && millis() - sPaceLastBackoffMs > 2000) {
+        sPaceAcked = 0;
+        sPaceRate += sPaceRate / 8;
+        if (sPaceRate > sPaceLine) sPaceRate = sPaceLine;
+    }
+}
+
+uint32_t slipPaceRate() { return sPaceRate ? sPaceRate : (uint32_t) PhysicalSerial.baudRate(); }
+uint32_t slipPaceBackoffs() { return sPaceBackoffs; }
+
+// Waits until the target rate allows the next n bytes, then books their time.
+static void slipPaceChunk(uint32_t n) {
+    if (!sPaceRate || sPaceRate >= sPaceLine) { sPaceNextUs = micros(); return; }
+    int32_t wait;
+    while ((wait = (int32_t) (sPaceNextUs - micros())) > 0) {
+        if (wait > 2000) delay(1); else delayMicroseconds(wait > 100 ? 100 : (uint32_t) wait);
+    }
+    uint32_t now = micros();
+    if ((int32_t) (now - sPaceNextUs) > 20000) sPaceNextUs = now;     // idle a while: no credit to burst with
+    sPaceNextUs += (uint32_t) ((uint64_t) n * 10ULL * 1000000ULL / sPaceRate);
+}
+
+// ---- send a SLIP-encoded frame ----
+// Takes a raw IP packet and sends it SLIP-framed to PhysicalSerial, in chunks spaced to the pace.
+
+unsigned long slipLastActivityMs = 0;
+uint32_t slipTxMicros = 0;
+uint32_t slipTxBytes = 0;
+
+#define SLIP_TX_CHUNK 64
+
+void slipSendFrame(SlipContext* ctx, const uint8_t* data, uint16_t length) {
+    slipLastActivityMs = millis();   // traffic to the Palm keeps the SLIP timeout away
+    uint32_t txT0 = micros();
+    if (logOn(LOG_VERBOSE)) {
+        logPrintf(LOG_VERBOSE, "SLIP: Sending frame, %d bytes\r\n", length);
+    }
+
+    // Encode first (RFC 1055: END at the start flushes line noise and delimits back-to-back frames), then send in chunks, each when the pace allows.
+    static uint8_t enc[2 * SLIP_BUFFER_SIZE + 4];
+    uint32_t n = 0;
+    enc[n++] = SLIP_END;
+    for (uint16_t i = 0; i < length; i++) {
+        switch (data[i]) {
+            case SLIP_END: enc[n++] = SLIP_ESC; enc[n++] = SLIP_ESC_END; break;
+            case SLIP_ESC: enc[n++] = SLIP_ESC; enc[n++] = SLIP_ESC_ESC; break;
+            default:       enc[n++] = data[i]; break;
+        }
+    }
+    enc[n++] = SLIP_END;
+
+    for (uint32_t off = 0; off < n; ) {
+        uint32_t c = n - off;
+        if (c > SLIP_TX_CHUNK) c = SLIP_TX_CHUNK;
+        slipPaceChunk(c);
+        PhysicalSerial.write(enc + off, c);
+        off += c;
+    }
+    ctx->bytesSent += n;
+    ctx->framesSent++;
+    slipTxMicros += micros() - txT0;
+    slipTxBytes += n;
+}
+
+// ---- reset the SLIP receiver (after a timeout or error, to resync with incoming data) ----
 
 void slipReset(SlipContext* ctx) {
     ctx->rxState = SLIP_RX_IDLE;

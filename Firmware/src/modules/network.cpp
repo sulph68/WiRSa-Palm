@@ -1,59 +1,50 @@
 #include "network.h"
+#include "modes.h"
+#include "led.h"
 #include "globals.h"
 #include "serial_io.h"
-#include "display_menu.h"    // showMessage()/readSwitches()/waitSwitches() - waitForWiFiConnection()'s own UI
+#if WIRSA_FEATURE_MESH
+#include "mesh_ble.h"
+#endif
+#include "display_menu.h"  // showMessage()/readSwitches()/waitSwitches(): waitForWiFiConnection()'s UI
 #include <Adafruit_SSD1306.h>
 #include <ESPmDNS.h>
 
-// LED_PIN/RXD2/TXD2 come from globals.h, included directly like every
-// other module. RTS/CTS/DTR/DCD/DSR/RI aren't wired on this hardware and
-// have no pin defines here (DCD/DSR/RI were removed - dead leftover modem/
-// telnet-BBS signaling, see globals.h's own pin-definitions comment).
+// LED_PIN, RXD2 and TXD2 come from globals.h. RTS/CTS/DTR/DCD/DSR/RI are not wired and have no pin defines (see globals.h).
 
-// Result codes (avoid R_OK conflict with system header)
+// Result codes (R_OK would conflict with a system header)
 #define R_MODEM_OK 0
 #define R_ERROR 4
 #define R_OK_STAT 200
 
-// Forward declarations for functions still in main.cpp
+// Forward declarations for main.cpp functions
 extern void showMessage(String message);
 extern void firmwareCheck();
 
-// WiFi symbols for display
 extern const uint8_t PROGMEM wifi_symbol[];
 
-// Global variables (defined in main.cpp)
-extern Adafruit_SSD1306 display;
+// Globals defined in main.cpp
+extern WirsaDisplay display;
 extern String ssid, password;
 extern MDNSResponder mdns;
 extern byte serialSpeed;
 extern const int bauds[];
 extern HardwareSerial PhysicalSerial;
 
-// One-time setup that must run exactly once per fresh association - called
-// by maintainWiFi() and waitForWiFiConnection() alike so the two paths
-// can't double-run mdns.begin()/tcpServer.begin() against each other.
+// One-time setup per fresh association, called by maintainWiFi() and waitForWiFiConnection() so the two paths cannot double-run mdns.begin().
 static void wifiOnConnected() {
-  // Disables modem-sleep: a sleeping radio can silently drop association
-  // mid-handshake during a heavier network operation (e.g. TLS against a
-  // remote with a larger cert chain/more round trips). Set here so it
-  // re-applies on every fresh association, not just the first.
-  //
-  // TX power is left at the ESP32 core's own default rather than maxed -
-  // max power draws more current per TX burst with no range benefit on an
-  // already-strong link, and the extra draw risks a brief brownout/
-  // self-interference right as a handshake bursts packets.
+  // Modem-sleep off: a sleeping radio can drop the association mid-handshake during a heavier operation (e.g. TLS with a larger cert chain). Set here so it applies on every fresh association.
+  // TX power stays at the core's default, not maxed: maximum draws more per TX burst with no range benefit on a strong link, and risks a brief brownout or self-interference as a handshake bursts packets.
+#if WIRSA_FEATURE_MESH
+  // While Bluetooth is on (Mesh mode, or a background check at the main menu) WiFi must keep modem sleep, or the coexistence code aborts.
+  WiFi.setSleep(menuMode == MODE_MESH || MeshBle::active());
+#else
   WiFi.setSleep(false);
+#endif
 
   SerialPrint("CONNECTED TO "); SerialPrintLn(WiFi.SSID());
   SerialPrint("IP ADDRESS: "); SerialPrintLn(ipToString(WiFi.localIP()));
-  // A tcpServer used to bind and listen here, but nothing in the live
-  // firmware ever called tcpServer.available()/hasClient()/accept() to pull
-  // a connection off it - that consumption only existed in the old
-  // AT-command modem/telnet-BBS logic (main.cpp.backup, not in the live
-  // build). tcpServer/tcpServerPort/tcpClient/consoleClient/
-  // consoleConnected and the telnet EEPROM flag (settings.cpp) have since
-  // all been removed outright as dead weight, not just left unbound here.
+  // (A tcpServer used to listen here; nothing in the live firmware accepted from it, only the removed AT-command modem and telnet BBS logic did, so it and its settings are gone.)
   mdns.begin("WiRSa"); // wirsa.local - also advertises the FTP server
   mdns.addService("ftp", "tcp", 21);
   SerialPrintLn("FTP SERVER: ftp://wirsa.local (once started)");
@@ -61,8 +52,7 @@ static void wifiOnConnected() {
   firmwareCheck();
 }
 
-// Get signal strength level (0-4) from RSSI
-// Returns: 0 = no signal, 1 = weak, 2 = fair, 3 = good, 4 = excellent
+// Signal level from RSSI: 0 none, 1 weak, 2 fair, 3 good, 4 excellent
 int getSignalBars() {
   if (WiFi.status() != WL_CONNECTED) return 0;
 
@@ -74,11 +64,10 @@ int getSignalBars() {
   else return 0;                   // Very weak / no signal
 }
 
-// Draw a dithered (gray) bar by alternating pixels in a checkerboard pattern
+// A dithered (gray) bar: a checkerboard of pixels
 void drawDitheredBar(int x, int y, int w, int h) {
   for (int py = y; py < y + h; py++) {
     for (int px = x; px < x + w; px++) {
-      // Checkerboard pattern: draw pixel if (px + py) is even
       if ((px + py) % 2 == 0) {
         display.drawPixel(px, py, SSD1306_BLACK);
       }
@@ -87,50 +76,44 @@ void drawDitheredBar(int x, int y, int w, int h) {
 }
 
 void showWifiIcon() {
-  // Icon position and size (in header area which has white background)
+  // Icon position and size (in the header area, white background)
   const int iconX = 72;
   const int iconY = 4;
   const int iconW = 11;
   const int iconH = 8;
 
-  // Clear the icon area first (fill with white since header is white)
+  // Clear the icon area (white, as the header)
   display.fillRect(iconX, iconY, iconW, iconH, SSD1306_WHITE);
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_PIN, LOW);  // LED on
+    ledSet(true);  // LED on
 
     int bars = getSignalBars();
 
-    // Draw signal bars (drawing in BLACK on white header background)
-    // 4 bars, each 2 pixels wide with 1 pixel gap
-    // Heights: bar1=2px, bar2=4px, bar3=6px, bar4=8px (from bottom at iconY+iconH)
+    // Signal bars in BLACK on the white header: 4 bars, 2 pixels wide with a 1-pixel gap, heights 2/4/6/8 px from the bottom at iconY+iconH
 
     int barWidth = 2;
     int gap = 1;
     int baseY = iconY + iconH;  // Bottom of icon area
 
-    // Bar 1 (shortest, leftmost) - height 2
     if (bars >= 1) {
       display.fillRect(iconX, baseY - 2, barWidth, 2, SSD1306_BLACK);
     } else {
       drawDitheredBar(iconX, baseY - 2, barWidth, 2);
     }
 
-    // Bar 2 - height 4
     if (bars >= 2) {
       display.fillRect(iconX + barWidth + gap, baseY - 4, barWidth, 4, SSD1306_BLACK);
     } else {
       drawDitheredBar(iconX + barWidth + gap, baseY - 4, barWidth, 4);
     }
 
-    // Bar 3 - height 6
     if (bars >= 3) {
       display.fillRect(iconX + 2*(barWidth + gap), baseY - 6, barWidth, 6, SSD1306_BLACK);
     } else {
       drawDitheredBar(iconX + 2*(barWidth + gap), baseY - 6, barWidth, 6);
     }
 
-    // Bar 4 (tallest, rightmost) - height 8
     if (bars >= 4) {
       display.fillRect(iconX + 3*(barWidth + gap), baseY - 8, barWidth, 8, SSD1306_BLACK);
     } else {
@@ -138,29 +121,21 @@ void showWifiIcon() {
     }
 
   } else {
-    digitalWrite(LED_PIN, HIGH); // LED off
-    // Draw X for no connection
+    ledSet(false); // LED off
+    // X: no connection
     display.drawLine(iconX + 1, iconY + 1, iconX + iconW - 2, iconY + iconH - 2, SSD1306_BLACK);
     display.drawLine(iconX + iconW - 2, iconY + 1, iconX + 1, iconY + iconH - 2, SSD1306_BLACK);
   }
   display.display();
 }
 
-// Every WiFi.disconnect() call in the firmware funnels through here - the
-// one place to add/tune disconnect-time behavior (e.g. WiFi.disconnect(true)
-// to also erase stored credentials, or debug logging on every disconnect)
-// so a change here applies everywhere at once: retryWiFi() below, WiFi
-// Setup's pre-scan and pre-test-connect disconnects, and disconnectWiFi()
-// itself. Mirrors wifiBeginConnect()'s own role for WiFi.begin().
+// Every WiFi.disconnect() funnels through here, the one place to tune disconnect-time behaviour (e.g. WiFi.disconnect(true) to erase credentials, or logging): retryWiFi(),
+// WiFi Setup's pre-scan and pre-test disconnects, and disconnectWiFi(). The counterpart of wifiBeginConnect() for WiFi.begin().
 void wifiDisconnect() {
   WiFi.disconnect();
 }
 
-// Convenience wrapper for callers that also want the UI settled afterward
-// (a brief pause + an immediate icon redraw showing "disconnected") rather
-// than just the raw disconnect - currently no caller needs that combination
-// (every existing disconnect site has its own different follow-up timing),
-// kept as the natural place for one that does.
+// For a caller that also wants the UI settled (a brief pause and an immediate "disconnected" icon). No caller needs that today (each disconnect site has its own follow-up timing); kept as the place for one.
 void disconnectWiFi() {
   wifiDisconnect();
   delay(500);
@@ -173,42 +148,51 @@ String ipToString(IPAddress ip) {
   return s;
 }
 
-// Every WiFi.begin() call in the firmware funnels through here - see the
-// declaration comment in network.h for why. Currently a thin wrapper; add
-// any connection-time tuning (TX power, PHY mode, channel/BSSID hints, a
-// forced WiFi.mode(WIFI_STA), etc.) here and it reaches every caller.
+// Every WiFi.begin() funnels through here (see network.h): add connection-time tuning (TX power, PHY mode, channel/BSSID hints, a forced WIFI_STA) here and it reaches every caller.
+static void wifiDisconnectEventHandler(arduino_event_id_t event, arduino_event_info_t info);
+// Registered on the first WiFi.begin() of any kind (WiFi Setup's test connect too), not only from maintainWiFi(), which returns early until credentials are saved: first-time setup failures were silent.
+static void wifiRegisterDisconnectLog() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  WiFi.onEvent(wifiDisconnectEventHandler, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+}
+
+static const char *wifiStatusName(wl_status_t st) {
+  switch (st) {
+    case WL_IDLE_STATUS:     return "IDLE";
+    case WL_NO_SSID_AVAIL:   return "NO_SSID_AVAIL (SSID not seen)";
+    case WL_SCAN_COMPLETED:  return "SCAN_COMPLETED";
+    case WL_CONNECTED:       return "CONNECTED";
+    case WL_CONNECT_FAILED:  return "CONNECT_FAILED (wrong password / auth)";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED:    return "DISCONNECTED";
+    default:                 return "NO_SHIELD / unknown";
+  }
+}
+
 void wifiBeginConnect(const char *connSsid, const char *connPassword) {
-  WiFi.begin(connSsid, connPassword);
+  wifiRegisterDisconnectLog();
+  wl_status_t r = WiFi.begin(connSsid, connPassword);
+#if !defined(WIRSA_BOARD_T7S3)
   WiFi.setTxPower(WIFI_POWER_15dBm);
+#endif   // T7-S3: the core's default TX power connects; 15 dBm did not (tested)
+  Serial.printf("[%8lu] WiFi: begin \"%s\" (password %u chars) -> %s\r\n",
+                (unsigned long) millis(), connSsid, (unsigned) strlen(connPassword), wifiStatusName(r));
 }
 
 void wifiReconnectToSaved() {
   if (ssid.length() == 0) return;  // matches every inline call site this
-                                    // replaced - deliberately NOT also
-                                    // requiring password.length()>0, since a
-                                    // saved open network has an empty one
+                                    // not also requiring password.length() > 0: a saved open network has an empty one
   wifiBeginConnect(ssid.c_str(), password.c_str());
 }
 
-// ============================================================================
-// Background WiFi connection manager
-// ============================================================================
-// maintainWiFi() is called once per loop() iteration and never blocks: it
-// only calls WiFi.begin() (async - returns immediately, ESP32's own WiFi
-// task does the actual association) and polls WiFi.status(). This keeps
-// WiFi up proactively for every WiFi-requiring feature (FTP/SLIP/
-// BitWarden) rather than each one connecting on demand.
-//
-// Once configured (SSID+password set), this retries every WIFIMGR_RETRY_MS
-// for up to one WIFIMGR_GRACE_MS window (1 minute) - if still not
-// connected by then, it gives up (no more WiFi.begin() calls) and the icon
-// settles into a static "not connected" glyph. It does not auto-resume
-// after that; a fresh window only starts via retryWiFi() (Utilities'
-// "Retry WiFi" item) or a WiFi-requiring service's own
-// waitForWiFiConnection() call, both below. Retrying indefinitely instead
-// doesn't help - the ESP32 WiFi driver stops actually attempting
-// association after about a minute of repeated WiFi.begin() calls
-// regardless, so an explicit stop+manual-retry model matches real behavior.
+// ---- Background WiFi connection manager ----
+// maintainWiFi() runs once per loop() pass and never blocks: it only calls WiFi.begin() (async; the ESP32's WiFi task associates) and polls WiFi.status(), so WiFi stays up for every feature
+// that needs it (FTP, SLIP, BitWarden) instead of each connecting on demand.
+// Once configured (SSID and password set) it retries every WIFIMGR_RETRY_MS for one WIFIMGR_GRACE_MS window (1 minute); if still not connected it stops calling WiFi.begin() and the icon settles
+// to a static "not connected" glyph. It does not resume by itself: a fresh window starts only via retryWiFi() (Utilities' "Retry WiFi") or a service's waitForWiFiConnection(). Retrying
+// forever does not help, because the ESP32 WiFi driver stops attempting association after about a minute of repeated WiFi.begin() calls, so an explicit stop and manual retry matches reality.
 extern int menuMode;
 
 static bool wifiMgrWasConnected = false;      // last-known status, for edge detection
@@ -219,10 +203,7 @@ static unsigned long wifiMgrLastBeginMs = 0;
 static const unsigned long WIFIMGR_RETRY_MS = 20000;   // re-issue WiFi.begin() this often while trying
 static const unsigned long WIFIMGR_GRACE_MS = 90000;   // retry window before giving up / showing "not found"
 
-// Listens for the ESP-IDF WiFi driver's own disconnect event, which
-// carries the real reason code (esp_wifi_types.h's wifi_err_reason_t) and
-// RSSI at the exact moment it happens, rather than inferring anything
-// after the fact from WiFi.status() checked later.
+// The ESP-IDF driver's disconnect event carries the real reason code (esp_wifi_types.h wifi_err_reason_t) and RSSI at that moment, rather than inferring from WiFi.status() later.
 static const char *wifiReasonName(uint8_t r) {
   switch (r) {
     case 1: return "UNSPECIFIED";
@@ -250,9 +231,7 @@ static void wifiDisconnectEventHandler(arduino_event_id_t event, arduino_event_i
   if (event != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) return;
   uint8_t reason = info.wifi_sta_disconnected.reason;
   int8_t rssi = info.wifi_sta_disconnected.rssi;
-  // Timestamped with millis() so this can be lined up against
-  // caldav_relay.cpp's own [%8lu]-prefixed logs - this event fires from a
-  // different task/context than that module's request loop.
+  // Timestamped with millis() to line up with caldav_relay.cpp's [%8lu] logs; this event fires from another task than that module's request loop.
   Serial.printf("[%8lu] WiFi: STA_DISCONNECTED event - reason=%u (%s) rssi=%d heap=%u\r\n",
                 (unsigned long) millis(), reason, wifiReasonName(reason), (int) rssi, (unsigned) ESP.getFreeHeap());
 }
@@ -260,38 +239,24 @@ static void wifiDisconnectEventHandler(arduino_event_id_t event, arduino_event_i
 void maintainWiFi() {
   if (ssid == "" || password == "") return;  // not configured - nothing to maintain
 
-  static bool disconnectHandlerRegistered = false;
-  if (!disconnectHandlerRegistered) {
-    WiFi.onEvent(wifiDisconnectEventHandler, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-    disconnectHandlerRegistered = true;
-  }
+  wifiRegisterDisconnectLog();
 
   bool connected = (WiFi.status() == WL_CONNECTED);
   unsigned long now = millis();
 
-  // Pause new reconnect attempts while the physical serial port is in
-  // active use for a Palm<->WiRSa data protocol (HotSync/SASD/BitWarden
-  // Relay) - WiFi.begin() can briefly stall the whole sketch while the
-  // radio driver resets, disrupting these timing-sensitive transfers. SLIP
-  // Gateway is deliberately not included here - it depends on WiFi itself
-  // to function, so reconnecting while it's active is wanted. Doesn't
-  // affect waitForWiFiConnection() below, which drives its own WiFi.begin()
-  // calls directly rather than going through this background manager.
-  bool transferActive = (menuMode == MODE_FILE || menuMode == MODE_PLAYBACK || menuMode == MODE_BITWARDEN || menuMode == MODE_CALDAV_RELAY);
+  // Pause new reconnects while the serial port serves a Palm data protocol (HotSync/SASD/BitWarden Relay): WiFi.begin() can stall the whole sketch while the radio driver resets, disrupting
+  // timing-sensitive transfers. SLIP Gateway is not included: it needs WiFi, so reconnecting is wanted. waitForWiFiConnection() is unaffected, as it drives its own WiFi.begin().
+  bool transferActive = Modes::isTransfer(menuMode);
 
   if (connected) {
     if (!wifiMgrWasConnected) {
-      // Fresh association (boot, or recovered from a drop) - run the
-      // one-time on-connect setup (mDNS, firmware check).
+      // Fresh association (boot, or recovered from a drop): run the one-time on-connect setup (mDNS, firmware check).
       wifiOnConnected();
     }
     wifiMgrTrying = false;
   } else {
     if (wifiMgrWasConnected || !wifiMgrTrying) {
-      // Either just dropped, or this is the very first attempt this boot -
-      // start (or restart) an unbroken "trying" stretch and force an
-      // immediate fresh WiFi.begin() rather than waiting out the retry
-      // interval (unless a transfer is active - see transferActive above).
+      // Just dropped, or the first attempt this boot: start (or restart) an unbroken "trying" stretch and force a fresh WiFi.begin() at once, not after the retry interval (unless a transfer is active).
       wifiMgrTrying = true;
       wifiMgrTryingSinceMs = now;
       wifiMgrLastBeginMs = 0;
@@ -307,11 +272,14 @@ void maintainWiFi() {
   }
   wifiMgrWasConnected = connected;
 
-  // Icon draws in whatever header is currently on screen, not just MAIN's -
-  // every showHeader()-based menu screen calls this from showHeader()
-  // itself, and HotSync/SASD/SLIP/BitWarden's own custom headers call it
-  // directly too, so this periodic tick fires regardless of menuMode to
-  // keep the "searching" animation advancing on whichever one is showing.
+  // While trying, report the driver's status every 5 s so a silent failure (no disconnect event) shows on the USB log.
+  static unsigned long lastWifiLogMs = 0;
+  if (wifiMgrTrying && !wifiMgrGaveUp && now - lastWifiLogMs > 5000) {
+    lastWifiLogMs = now;
+    Serial.printf("[%8lu] WiFi: waiting, status=%s\r\n", (unsigned long) now, wifiStatusName(WiFi.status()));
+  }
+
+  // The icon draws in whatever header is on screen: showHeader() calls this, and HotSync/SASD/SLIP/BitWarden's custom headers call it too, so this tick fires regardless of menuMode to keep the "searching" animation moving.
   static unsigned long lastIconDrawMs = 0;
   static bool lastIconConnected = false;
   static bool lastIconAnimating = false;
@@ -328,14 +296,8 @@ void maintainWiFi() {
 
 void retryWiFi() {
   if (ssid == "" || password == "") return;  // nothing saved to retry
-  // Drop any stale association first so the WiFi.begin() below actually
-  // re-associates instead of being a no-op if we're still (weakly)
-  // connected. Resetting these statics is exactly what maintainWiFi() itself
-  // does on a fresh drop - wifiMgrLastBeginMs=0 makes its very next tick
-  // re-issue WiFi.begin() immediately rather than waiting out
-  // WIFIMGR_RETRY_MS, wifiMgrGaveUp=false lets it retry again at all, and
-  // wifiMgrTryingSinceMs=now restarts both the icon's animate-vs-"not found"
-  // window and the new give-up window.
+  // Drop any stale association first so the WiFi.begin() below re-associates and is not a no-op while still (weakly) connected. Resetting these statics is what maintainWiFi() does on a fresh
+  // drop: wifiMgrLastBeginMs = 0 makes its next tick re-issue WiFi.begin() at once, wifiMgrGaveUp = false lets it retry, and wifiMgrTryingSinceMs = now restarts the icon's animate-or-"not found" window and the give-up window.
   wifiDisconnect();
   wifiMgrWasConnected = false;
   wifiMgrTrying = true;
@@ -344,14 +306,9 @@ void retryWiFi() {
   wifiMgrLastBeginMs = 0;
 }
 
-// Blocking wait used by WiFi-requiring services (FTP Server/SLIP Gateway/
-// BitWarden Relay) at entry: shows "Waiting for WiFi..." while retrying,
-// and if still not connected after one WIFIMGR_GRACE_MS window, "WiFi
-// unavailable. Retry?" with ENTER retrying (another window) and BACK
-// cancelling (caller must then abandon its own startup). Drives its own
-// WiFi.begin() calls directly instead of going through maintainWiFi() -
-// that background manager is deliberately paused (transferActive, above)
-// during some of these same modes, which would otherwise deadlock this wait.
+// Blocking wait used by WiFi-requiring services (FTP Server, SLIP Gateway, BitWarden Relay) at entry: shows "Waiting for WiFi..." while retrying, and after one WIFIMGR_GRACE_MS window
+// "WiFi unavailable. Retry?" with ENTER retrying (another window) and BACK cancelling (the caller then abandons its startup). It drives its own WiFi.begin(): the background manager is paused
+// (transferActive) during some of these modes, which would otherwise deadlock this wait.
 bool waitForWiFiConnection() {
   if (ssid == "" || password == "") {
     showMessage("CONFIGURE SSID\nAND PASSWORD\nOVER SERIAL");
@@ -374,8 +331,7 @@ bool waitForWiFiConnection() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-      // Keep the background manager's own state in sync so its next tick
-      // doesn't think it's still trying (and re-run wifiOnConnected() again).
+      // Keep the background manager's state in sync so its next tick does not think it is still trying (and run wifiOnConnected() again).
       wifiOnConnected();
       wifiMgrWasConnected = true;
       wifiMgrTrying = false;
@@ -383,6 +339,9 @@ bool waitForWiFiConnection() {
       return true;
     }
 
+#if !WIRSA_HAS_BUTTONS
+    return false;   // screenless: nobody to press Retry - the caller gives up
+#else
     showMessage("WiFi unavailable.\n\nENTER: Retry\nBACK: Exit");
     while (true) {
       readSwitches();
@@ -390,20 +349,21 @@ bool waitForWiFiConnection() {
       if (BTNBK) { waitSwitches(); return false; } // give up - caller returns to its own previous menu
       delay(100);
     }
+#endif
   }
 }
 
-// 3 vertical bars (mobile-signal-strength style), drawn in the same header
-// icon slot showWifiIcon() already uses (iconX=72,iconY=4 - inside the
-// white header bar every showHeader() call paints). Three distinct visual
-// states:
-//   - Connected: 0-3 bars lit solid, mapped from getSignalBars()'s existing
-//     0-4 RSSI scale (collapsed to 0-3 - see the mapping below).
-//   - Connecting/searching, still within WIFIMGR_GRACE_MS: bars animate,
-//     climbing 0->1->2->3 then resetting, like a phone "searching" glyph -
-//     advanced by maintainWiFi()'s own timer, not redrawn every call.
-//   - Not connected, past the grace window (or WiFi never configured at
-//     all): static X, same glyph showWifiIcon() already uses for "no link".
+// Control link STATUS (palm_ctl.cpp): 0 no network set up, 1 connecting, 2 connected, 3 gave up retrying.
+uint8_t wifiStateCode() {
+  if (WiFi.status() == WL_CONNECTED) return 2;
+  if (ssid == "") return 0;
+  return wifiMgrGaveUp ? 3 : 1;
+}
+
+// 3 vertical bars (mobile signal style) in the header icon slot showWifiIcon() uses (iconX=72, iconY=4, inside the white header bar). Three states:
+//  - Connected: 0-3 bars lit solid, from getSignalBars()'s 0-4 scale (collapsed to 0-3).
+//  - Connecting, within WIFIMGR_GRACE_MS: the bars animate 0->1->2->3 and reset, like a phone "searching" glyph, advanced by maintainWiFi()'s timer, not redrawn every call.
+//  - Not connected past the grace window (or never configured): a static X, as showWifiIcon() uses for "no link".
 void drawWifiStatusIcon() {
   const int iconX = 72;
   const int iconY = 4;
@@ -418,9 +378,7 @@ void drawWifiStatusIcon() {
   bool connected = (WiFi.status() == WL_CONNECTED);
 
   if (!connected && !wifiMgrTrying) {
-    // Not configured, or a stretch hasn't started yet (e.g. this is called
-    // before the first maintainWiFi() tick) - same "no link" X as
-    // showWifiIcon()'s own disconnected state.
+    // Not configured, or no stretch started yet (called before the first maintainWiFi() tick): the same "no link" X.
     display.drawLine(iconX + 1, iconY + 1, iconX + iconW - 2, iconY + iconH - 2, SSD1306_BLACK);
     display.drawLine(iconX + iconW - 2, iconY + 1, iconX + 1, iconY + iconH - 2, SSD1306_BLACK);
     display.display();
@@ -429,26 +387,22 @@ void drawWifiStatusIcon() {
 
   int litBars;  // 0-3
   if (connected) {
-    // Collapse the existing 0-4 RSSI scale down to 0-3 for a 3-bar glyph.
+    // collapse the 0-4 scale to 0-3 for a 3-bar glyph
     int bars4 = getSignalBars();
     litBars = (bars4 * 3 + 2) / 4;  // rounds 0->0,1->1,2->2,3->2,4->3
     if (litBars > 3) litBars = 3;
   } else if (millis() - wifiMgrTryingSinceMs > WIFIMGR_GRACE_MS) {
-    // Past the grace window and still not connected - static "not found",
-    // same X glyph as the disconnected case above.
+    // Past the grace window and not connected: the static "not found" X.
     display.drawLine(iconX + 1, iconY + 1, iconX + iconW - 2, iconY + iconH - 2, SSD1306_BLACK);
     display.drawLine(iconX + iconW - 2, iconY + 1, iconX + 1, iconY + iconH - 2, SSD1306_BLACK);
     display.display();
     return;
   } else {
-    // Still within the grace window - animate a climbing-bars "searching"
-    // pulse (0,1,2,3 bars lit, then back to 0) driven by wall-clock time so
-    // it advances smoothly regardless of exactly when maintainWiFi() last
-    // happened to be called.
+    // Within the grace window: a climbing-bars "searching" pulse (0,1,2,3 lit, then 0) driven by wall-clock time, so it advances smoothly whenever maintainWiFi() last ran.
     litBars = (int) ((millis() / 400) % 4);
   }
 
-  // 3 bars, each 2px wide with 1px gap, heights 3/5/8px (bottom-aligned).
+  // 3 bars, 2 px wide with a 1 px gap, heights 3/5/8 px, bottom-aligned
   int heights[3] = {3, 5, 8};
   for (int b = 0; b < 3; b++) {
     int bx = iconX + b * (barWidth + gap);

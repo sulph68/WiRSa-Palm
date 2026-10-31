@@ -47,6 +47,7 @@
  */
 
 #include <FtpServer.h>
+void sdActivity();   // WiRSa: flash the LED on SD traffic (src/modules/sd_activity.cpp)
 #include <ctype.h>
 #include <new>
 
@@ -1656,6 +1657,7 @@ bool FtpServer::doRetrieve()
   }
 
 //  int16_t nb = file.read( buf, FTP_BUF_SIZE );
+  sdActivity();
 #ifdef DYNAMIC_TRANSFER_BUFFER
 	int16_t nb = file.read( buf, ftp_buf_size );
 #else
@@ -1720,6 +1722,7 @@ bool FtpServer::doStore()
 	    DEBUG_IDX; DEBUG_PRINT(F("NB -> "));
 	    DEBUG_PRINTLN(nb);
 
+    sdActivity();
     rc = file.write( buf, nb );
     DEBUG_IDX; DEBUG_PRINT(F("RC -> "));
     DEBUG_PRINTLN(rc);

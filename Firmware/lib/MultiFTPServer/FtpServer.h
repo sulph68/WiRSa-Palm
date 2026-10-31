@@ -348,7 +348,14 @@
 	#include <SPI.h>
 	#include <SD.h>
 
-	#define STORAGE_MANAGER SD
+	// WiRSa: serve a root with the SD card and the virtual card as folders (ftp_rootfs.h) rather
+	// than the SD object alone. FtpServerKey.h sets the header so both translation units agree.
+	#ifdef FTP_STORAGE_MANAGER_HEADER
+		#include FTP_STORAGE_MANAGER_HEADER
+		#define STORAGE_MANAGER gFtpRootFs
+	#else
+		#define STORAGE_MANAGER SD
+	#endif
   	#define FTP_FILE File
   	#define FTP_DIR File
 

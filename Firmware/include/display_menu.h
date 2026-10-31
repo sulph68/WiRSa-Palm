@@ -21,36 +21,32 @@ void baudMenu(bool arrow);
 void orientationMenu(bool arrow);
 void ftpServerMenu(bool arrow);
 void readSwitches();
-void readBackSwitch();
 void waitSwitches();
-void waitBackSwitch();
 String padLeft(String s, int len);
 String padRight(String s, int len);
 String liveBaudStr(uint32_t baud);
 
 // Relocated from modem.cpp (not modem-specific - general menu-loop/input
 // helpers other modes depend on) during MODEM mode removal.
-String getLine();
-String prompt(String msg, String dflt = "");
 void led_on();
 void mainLoop();
 void baudLoop();
 void orientationLoop();
 void settingsLoop();
 void printSDCardInfo();
+#if WIRSA_FEATURE_SASD
+void startSasdFromMenu();       // the D key: the disk check, then SASD mode (modes.cpp)
+#endif
+#if WIRSA_FEATURE_HOTSYNC
+bool startHotsyncFromMenu();   // H key / BOOT button: SD check, then HotSync mode
+#endif
 void ftpServerLoop();
-void sendResult(int resultCode);
-
-// checkCancel()/clearInputBuffer() relocated here from file_transfer.cpp
-// during its removal (XMODEM/YMODEM/ZMODEM file transfer, confirmed
-// unreachable from the main menu) - both are still genuinely used by
-// getLine()/prompt() above, which SLIP Gateway's config prompts depend on.
-bool checkCancel();
-void clearInputBuffer();
 
 // Generic blocking character-entry primitive, generalized from the WiFi-join
 // password entry mechanism (wifi_setup.cpp) for reuse by FTP/AP credential
-// setup - see settingsLoop()'s FTP Setup/AP Setup handling.
-bool charEntryPrompt(const char *title, char *buf, int maxLen);
+// setup - see settingsLoop()'s FTP Setup/AP Setup handling. charset limits
+// what can be entered (e.g. "0123456789." for SLIP Setup's addresses); the
+// default, NULL, is every printable character, starting at 'A'.
+bool charEntryPrompt(const char *title, char *buf, int maxLen, const char *charset = NULL);
 
 #endif // DISPLAY_MENU_H

@@ -5,9 +5,7 @@
 #include "slip.h"
 #include "slip_nat.h"
 
-// ============================================================================
-// SLIP Mode States
-// ============================================================================
+// ---- SLIP mode states ----
 
 enum SlipModeState {
     SLIP_MODE_IDLE,     // Not active
@@ -17,9 +15,7 @@ enum SlipModeState {
     SLIP_MODE_ERROR     // Error state
 };
 
-// ============================================================================
-// SLIP Configuration (saved to EEPROM)
-// ============================================================================
+// ---- SLIP configuration (saved to EEPROM) ----
 
 struct SlipConfig {
     IPAddress slipIP;       // Gateway IP (ESP32 side)
@@ -28,9 +24,7 @@ struct SlipConfig {
     IPAddress dnsServer;    // DNS server
 };
 
-// ============================================================================
-// SLIP Mode Context
-// ============================================================================
+// ---- SLIP mode context ----
 
 struct SlipModeContext {
     SlipModeState state;
@@ -39,77 +33,39 @@ struct SlipModeContext {
     int previousMenuMode;  // Track previous mode for proper return
 };
 
-// ============================================================================
-// EEPROM Addresses for SLIP Configuration
-// ============================================================================
+// ---- EEPROM addresses for the SLIP configuration ----
 
-// Renumbered to sit immediately after globals.h's own ESC_CHAR_ADDRESS
-// (103, 1 byte) - see that file's own comment on the compacted layout and
-// the one-time defaultEEPROM() reset this renumbering requires.
-#define SLIP_EEPROM_BASE        104
+// Renumbered to follow globals.h's ESC_CHAR_ADDRESS (103, 1 byte); see its comment on the compact layout and the one-time defaultEEPROM() reset the renumbering needs.
 #define SLIP_IP_ADDRESS         104   // 4 bytes - Gateway IP
 #define SLIP_CLIENT_IP_ADDRESS  108   // 4 bytes - Client IP
 #define SLIP_SUBNET_ADDRESS     112   // 4 bytes - Subnet mask
 #define SLIP_DNS_ADDRESS        116   // 4 bytes - DNS server
-#define SLIP_EEPROM_END         120   // End of SLIP EEPROM area
-// Note: Port forwards are stored in a shared location (PORTFWD_BASE in globals.h)
 
-// ============================================================================
-// Function Declarations - Mode Interface
-// ============================================================================
+// ---- mode interface ----
 
-// Menu function (called to enter/display SLIP menu)
-void slipMenu(bool arrow);
-
-// Main loop function (called from main loop when in MODE_SLIP)
+// main loop (called from loop() in MODE_SLIP)
 void slipLoop();
 
-// Enter SLIP gateway mode (start SLIP processing)
 void enterSlipMode();
 
-// Exit SLIP gateway mode (stop SLIP, return to menu)
+// exit SLIP gateway mode (the caller returns to the main menu)
 void exitSlipMode();
 
-// ============================================================================
-// Function Declarations - Display
-// ============================================================================
+// ---- display ----
 
-// Show SLIP status on display
 void slipShowStatus();
 
-// Show SLIP statistics
-void slipShowStatistics();
 
-// ============================================================================
-// Function Declarations - Configuration
-// ============================================================================
+// ---- configuration ----
 
-// Load SLIP settings from EEPROM
 void loadSlipSettings();
 
-// Save SLIP settings to EEPROM
 void saveSlipSettings();
 
-// Set default SLIP configuration
-void slipDefaultConfig();
+// Config menu's "SLIP Setup": Gateway IP / Client IP / DNS Server prompts
+void slipSetup();
 
-// Configure IP addresses
-void slipConfigureIP();
-
-// Configure port forwards
-void slipConfigurePortForward();
-
-// ============================================================================
-// Function Declarations - AT Commands
-// ============================================================================
-
-// Handle SLIP-related AT commands
-// Returns true if command was handled
-bool handleSlipCommand(String& cmd, String& upCmd);
-
-// ============================================================================
-// Global Contexts (defined in slip_mode.cpp)
-// ============================================================================
+// ---- global contexts (defined in slip_mode.cpp) ----
 
 extern SlipContext slipCtx;
 extern NatContext natCtx;

@@ -6,11 +6,9 @@
 #include <WiFiClient.h>
 #include <WiFiUdp.h>
 
-// ============================================================================
-// NAT Configuration Constants
-// ============================================================================
+// ---- NAT Configuration Constants ----
 
-// Connection table sizes (ESP32 RAM limited - ~320KB total)
+// Connection table sizes (RAM is limited, ~320 KB in all)
 #define NAT_MAX_TCP_CONNECTIONS  16    // Max concurrent TCP connections
 #define NAT_MAX_UDP_SESSIONS     32    // Max concurrent UDP sessions (increased for DNS)
 #define NAT_MAX_ICMP_SESSIONS    8     // Max concurrent ICMP (ping) sessions
@@ -18,134 +16,70 @@
 
 // Timeout values (milliseconds)
 #define NAT_TCP_TIMEOUT_MS       1800000 // 30 minutes for established TCP (IRC, etc)
-// Was 30000 (30s). Shrunk as part of the per-entry-socket fix below: each
-// NatUdpEntry now owns its own bound socket rather than sharing one, and
-// CONFIG_LWIP_MAX_SOCKETS is a hard system-wide 16-socket ceiling shared
-// with TCP (NAT_MAX_TCP_CONNECTIONS=16 was already sized against that,
-// assuming UDP used exactly one socket total). An entry that never gets a
-// response used to hold its socket open for the full 30s, and several such
-// entries overlapping was enough to exhaust that shared pool and starve TCP
-// too. Real observed DNS/NTP round-trips have all been under 150ms, so 5s
-// leaves generous margin for a genuinely slow server while making sure a
-// dead/unanswered query's socket doesn't linger long enough to accumulate.
+// Shrunk from 30 s: each NatUdpEntry owns a bound socket, and CONFIG_LWIP_MAX_SOCKETS is a system-wide 16-socket ceiling shared with TCP. An entry that never gets an answer
+// held its socket 30 s, and several overlapping starved TCP too. DNS/NTP round trips are under 150 ms, so 5 s leaves margin for a slow server without letting dead queries pile up.
 #define NAT_UDP_TIMEOUT_MS       5000    // 5 seconds for UDP
 #define NAT_TCP_SYN_TIMEOUT_MS   30000   // 30 seconds for connection setup (outer safety net -
-                                          // natPollConnections' own NAT_TCP_CONNECT_TIMEOUT_MS
-                                          // check reacts much faster than this in normal operation)
+                                          // natPollConnections' NAT_TCP_CONNECT_TIMEOUT_MS check reacts much faster than this in normal operation
 #define NAT_ICMP_TIMEOUT_MS      10000   // 10 seconds for ICMP
 #define NAT_TCP_KEEPALIVE_MS     300000  // 5 minutes between keepalives
 #define NAT_TCP_STALL_TIMEOUT_MS 60000   // 60s stall detection
 
-// How long a connection in NAT_TCP_CLOSING/NAT_TCP_FIN_WAIT stays in the
-// table before natCleanupExpired reaps it. The Palm-side FTP client
-// (lazyFTP) doesn't notice a closed connection until its own NetLibReceive
-// blocking-read timeout (up to 60s) elapses - a FIN with zero payload
-// doesn't unblock it early. If the gateway reaps the entry sooner than
-// that, anything the client sends afterward (a delayed FIN, or a retry)
-// hits "no entry" and the transfer looks broken even though the data
-// already arrived intact. This comfortably exceeds that 60s client-side wait.
+// How long a NAT_TCP_CLOSING/NAT_TCP_FIN_WAIT connection stays before natCleanupExpired reaps it. The Palm's FTP client (lazyFTP) does not notice a closed connection until its
+// NetLibReceive blocking read times out (up to 60 s); reaping sooner makes its delayed FIN or retry hit "no entry" and the transfer look broken though the data arrived. This exceeds that wait.
 #define NAT_TCP_CLOSING_TIMEOUT_MS 75000
 
-// Non-blocking connect() poll timeout - checked every loop iteration in
-// natPollConnections, so this is the real deadline for a stuck connection
-// attempt (a bit more generous than WiFiClient's blocking 3s default since
-// waiting longer here no longer freezes the rest of the gateway).
+// Non-blocking connect() poll timeout, checked every loop pass in natPollConnections: the real deadline for a stuck attempt (more generous than WiFiClient's blocking 3 s, since waiting no longer freezes the gateway).
 #define NAT_TCP_CONNECT_TIMEOUT_MS 6000
 
-// How often natPollConnections sends a zero-window probe (RFC 1122
-// 4.2.2.17) while the client's advertised window is fully used and we have
-// buffered data waiting. Real TCP receivers are only *required* to
-// acknowledge (accept or reject) an incoming byte, not to proactively send
-// an unsolicited window-update once their buffer drains - if PalmOS's own
-// TCP stack doesn't bother with the optional proactive update, and we've
-// correctly stopped sending because we think the window is exhausted,
-// nothing will ever prompt a fresh ACK from it on its own: a genuine silent
-// deadlock, only ever broken today by the 60s stall timeout giving up and
-// tearing the whole connection down. Probing (send 1 byte past the client's
-// stated window anyway) forces a fresh ACK+window one way or another -
-// accepted if the client actually had room, or a duplicate ACK re-asserting
-// its current (still closed) window otherwise - either way we learn the
-// real state instead of guessing blind for up to a full minute.
+// How often natPollConnections sends a zero-window probe (RFC 1122 4.2.2.17) while the client's window is used up and data waits. A receiver need only ACK an incoming byte, not send an
+// unsolicited window update when its buffer drains; if PalmOS's stack does not, nothing prompts an ACK and the connection deadlocks until the 60 s stall timeout. Sending 1 byte past the stated window
+// forces an ACK and window either way, so we learn the real state instead of guessing for a minute.
 #define NAT_TCP_PROBE_INTERVAL_MS 2000
 
-// How long natPollConnections will wait for real forward ACK progress on
-// outstanding (sent but unacknowledged) data before assuming it was lost on
-// the serial link and re-emitting it from the still-buffered unacked region
-// (see NatTcpEntry::lastAckTime and the retransmit logic in
-// natPollConnections). This link has no hardware flow control and no error
-// correction of its own, so a byte can genuinely be dropped/corrupted in
-// transit; without this, that single lost segment stalls the connection
-// permanently until the much longer NAT_TCP_STALL_TIMEOUT_MS gives up and
-// tears the whole thing down (observed real-world: large FTP directory
-// listings bailing partway through with no further data ever arriving).
-// Deliberately well above a plausible real round-trip time on this link
-// (a full segment plus its ACK, SLIP-framed, at typical baud rates) to
-// avoid retransmitting live-but-slow traffic, and well below the 60s stall
-// timeout so a single loss doesn't sacrifice the rest of the transfer.
-#define NAT_TCP_RETRANSMIT_MS 3000
+// How long natPollConnections waits for ACK progress on outstanding data before assuming it was lost on the serial link and re-emitting it from the buffered unacked region (see
+// NatTcpEntry::lastAckTime). The link has no flow control or error correction, so a byte can be lost; without this one lost segment stalls the connection until NAT_TCP_STALL_TIMEOUT_MS
+// (seen: large FTP listings stopping partway). Well above a plausible round trip (a full SLIP-framed segment plus ACK) so live but slow traffic is not retransmitted, well below the 60 s stall timeout.
+#define NAT_TCP_RETRANSMIT_MS 3000          // ceiling of the retransmit timeout
+#define NAT_TCP_RETRANSMIT_BASE_MS 700      // floor; the line time of what is outstanding is added (slip_nat.cpp)
 
-// Upper cap (bytes) on how much unacknowledged data natPollConnections will
-// have in flight toward the client at once. This is a CEILING only - the
-// real, binding limit is always the client's own advertised TCP window
-// (entry->clientWindow), which must still be respected exactly, including a
-// real 0 (client's buffer is full - pause). There is deliberately no
-// *floor*: an earlier version of this code forced the effective window up
-// to a 1000-byte minimum even when the client advertised less, which is a
-// real TCP protocol violation - this NAT has no retransmit buffer, so bytes
-// sent past what the client can hold are simply lost with no way to
-// recover, leaving serverSeq permanently ahead of what the client will ever
-// ACK until the 60s stall timeout tears the connection down. Never
-// reintroduce a minimum here.
-//
-// Capped near one segment rather than left at the client's full advertised
-// window: the TCP window only bounds outstanding bytes, not how fast the
-// receiver's serial link can physically drain them. On a link with no
-// hardware flow control and a slow CPU, a multi-segment burst sent with no
-// pacing risks overrunning the Palm's UART receive buffering before its
-// TCP stack can process it - a link-layer problem TCP-window correctness
-// alone can't fix. This cap forces a real ACK round-trip between
-// successive sends, trading some throughput for reliability.
+// Receive window advertised to the Palm: what the gateway can take from the serial line without waiting for the server. It was 8192, twice the 4096-byte serial buffer, so a Palm sending
+// a full window during a slow server write could overrun the buffer.
+#define NAT_TCP_ADVERTISED_WINDOW 2048      // when there is no queue (no PSRAM)
+
+// Palm -> server queue per connection, in PSRAM, and the largest window advertised from it: the Palm may have that much in flight, so it can stream at line rate while the server catches up.
+#define NAT_TCP_TXQ_SIZE          32768
+#define NAT_TCP_TXQ_WINDOW_MAX    8192
+
+// How long one write to the server's socket may hold the main loop (ms).
+#define NAT_TCP_WRITE_TIMEOUT_MS 400
+
+// Upper cap (bytes) on unacknowledged data in flight toward the client. A CEILING only: the binding limit is the client's advertised window (entry->clientWindow), a real 0 included.
+// There is deliberately no floor: forcing a 1000-byte minimum violated TCP (no retransmit buffer, so bytes past the client's capacity were lost and serverSeq stayed ahead of any ACK until the 60 s
+// stall timeout). Never reintroduce a minimum.
+// Capped near one segment, not the client's full window: the window bounds outstanding bytes, not how fast the receiver's serial link drains them. With no hardware flow control and a slow CPU,
+// an unpaced multi-segment burst can overrun the Palm's UART buffering. This forces an ACK round trip between sends, trading some throughput for reliability.
 #define NAT_TCP_MAX_WINDOW       1400
 
-// RFC 879's default Maximum Segment Size for IPv4 when a TCP peer's SYN
-// carries no explicit MSS option - derived from the required minimum IP
-// reassembly buffer size of 576 bytes minus 40 bytes of IP+TCP headers.
-// Used as entry->clientMss's fallback when a real MSS option isn't found.
+// RFC 879's default MSS for IPv4 without an MSS option: the 576-byte minimum reassembly size minus 40 bytes of IP+TCP headers. The fallback for entry->clientMss.
 #define NAT_TCP_DEFAULT_MSS      536
 
-// Per-connection heap buffer (bytes) for data read from the remote socket
-// but not yet relayed to the client. Lets natPollConnections read greedily
-// from the (fast) WiFi/socket side, decoupled from the (slow, small-window)
-// serial side, instead of only reading exactly as much as the client's
-// window allows on each poll. Sized against the ESP32-S3's large heap
-// (>200KB free); worst case is NAT_MAX_TCP_CONNECTIONS (16) * this value,
-// though in practice this gateway serves ONE vintage computer at a time -
-// the 16 slots exist for that ONE client's several simultaneous connections
-// (control + PASV data + any port forwards), not many concurrent users, so
-// more than 2-4 slots actually holding a full buffer at once is unlikely.
-// Sizing this buffer larger doesn't by itself fix a burst overrunning the
-// Palm's own fixed UART/SLIP receive buffering - that's what
-// NAT_TCP_MAX_WINDOW's own pacing addresses; this is purely read-ahead
-// headroom on the fast side. Degrades gracefully on allocation failure
-// (see the malloc null-check in natPollConnections) rather than crashing
-// if heap ever gets tight.
+// Per-connection heap buffer (bytes) for data read from the server but not yet relayed to the client. It lets natPollConnections read greedily from the fast WiFi side, apart from the
+// slow, small-window serial side. Worst case is NAT_MAX_TCP_CONNECTIONS (16) x this, but the gateway serves ONE vintage computer whose 16 slots cover its several connections (control, PASV data,
+// forwards), so 2-4 full buffers at once is the realistic maximum. It does not fix a burst overrunning the Palm's UART buffering (NAT_TCP_MAX_WINDOW's pacing does). Degrades gracefully if allocation fails.
 #define NAT_TCP_RXBUF_SIZE       16384
 
 // Ephemeral port range for NAT
 #define NAT_PORT_START           10000
 #define NAT_PORT_END             60000
 
-// ============================================================================
-// IP Protocol Numbers
-// ============================================================================
+// ---- IP Protocol Numbers ----
 
 #define IP_PROTO_ICMP   1
 #define IP_PROTO_TCP    6
 #define IP_PROTO_UDP    17
 
-// ============================================================================
-// TCP Flags
-// ============================================================================
+// ---- TCP Flags ----
 
 #define TCP_FLAG_FIN    0x01
 #define TCP_FLAG_SYN    0x02
@@ -154,9 +88,7 @@
 #define TCP_FLAG_ACK    0x10
 #define TCP_FLAG_URG    0x20
 
-// ============================================================================
-// TCP NAT Connection States
-// ============================================================================
+// ---- TCP NAT Connection States ----
 
 enum NatTcpState {
     NAT_TCP_CLOSED,         // No connection
@@ -166,9 +98,7 @@ enum NatTcpState {
     NAT_TCP_CLOSING         // Waiting for final cleanup
 };
 
-// ============================================================================
-// NAT TCP Connection Entry
-// ============================================================================
+// ---- NAT TCP Connection Entry ----
 
 struct NatTcpEntry {
     bool active;
@@ -191,34 +121,21 @@ struct NatTcpEntry {
     uint32_t serverSeq;     // Last sequence from server
     uint32_t serverAck;     // Last ACK from server
 
-    // Client's advertised Maximum Segment Size, parsed from its SYN's TCP
-    // options (kind=2/MSS) if present, else RFC 879's default of 536 when
-    // no MSS option is sent at all. A segment larger than this is a real
-    // TCP protocol violation - a correct receiver is entitled to silently
-    // reject/drop it, regardless of how sends are paced or batched.
+    // The client's MSS from its SYN's TCP options (kind 2), else RFC 879's 536. A larger segment violates TCP: a correct receiver may drop it however sends are paced.
     uint16_t clientMss;
 
-    // Set once the vintage computer's OWN completing ACK of the 3-way
-    // handshake is received (the ACK that follows our SYN-ACK) - distinct
-    // from `state == NAT_TCP_ESTABLISHED`, which this code sets as soon as
-    // the GATEWAY's own outbound leg to the real server connects, before
-    // the client has necessarily acked anything back. Lets natProcessTcp
-    // log a real "client connected" event exactly once per connection.
+    // Set when the Palm's own completing ACK of the 3-way handshake arrives (the one after our SYN-ACK). Distinct from state == NAT_TCP_ESTABLISHED, which is set when the GATEWAY's leg to the
+    // server connects, before the client has acked anything. Lets natProcessTcp log "client connected" once per connection.
     bool clientHandshakeAcked;
 
-    // WiFiClient for this connection (null while a non-blocking connect is
-    // still pending - see pendingSockFd)
+    // WiFiClient for this connection (null while a non-blocking connect is pending, see pendingSockFd)
     WiFiClient* client;
 
-    // Non-blocking connect() state (NAT_TCP_SYN_SENT): raw socket fd for a
-    // connect() attempt in progress, polled from natPollConnections every
-    // loop iteration instead of blocking. -1 when no connect is pending.
+    // Non-blocking connect() state (NAT_TCP_SYN_SENT): the raw socket fd of an attempt in progress, polled from natPollConnections each pass; -1 when none.
     int pendingSockFd;
     unsigned long connectStartTime;
 
-    // Most recent TCP window size advertised by the client (vintage
-    // computer), used to size how much unacknowledged data we allow
-    // in flight toward it in natPollConnections' send-gating logic.
+    // The client's latest advertised TCP window, used to size the unacknowledged data allowed in flight (natPollConnections' send gating).
     uint16_t clientWindow;
 
     // RX buffer for data from server
@@ -233,31 +150,27 @@ struct NatTcpEntry {
     unsigned long lastProbe;        // Last zero-window probe sent
     unsigned long created;
 
-    // Last time entry->serverAck actually advanced (real forward progress),
-    // OR a fresh (non-retransmitted) send happened. This NAT has no way to
-    // detect a segment was corrupted/dropped on the flow-control-free serial
-    // link except by noticing the client never ack'd it - see the retransmit
-    // logic in natPollConnections, gated by NAT_TCP_RETRANSMIT_MS against
-    // this field. Distinct from lastActivity, which is touched by unrelated
-    // traffic (keepalives, probes, control packets) and would mask a stalled
-    // data stream if reused here.
+    // Last time entry->serverAck advanced (real progress) or a fresh (non-retransmitted) send happened. A segment corrupted or dropped on the flow-control-free link is detected only by the client
+    // never acking it (the retransmit logic in natPollConnections, gated by NAT_TCP_RETRANSMIT_MS on this field). Distinct from lastActivity, which unrelated traffic (keepalives, probes, control
+    // packets) touches and would mask a stalled stream.
     unsigned long lastAckTime;
 
-    // When this connection FIRST entered NAT_TCP_CLOSING/NAT_TCP_FIN_WAIT -
-    // set once on that transition, deliberately NEVER refreshed by later
-    // packets (unlike lastActivity, which every incoming packet touches).
-    // natCleanupExpired measures the CLOSING/FIN_WAIT timeout from this, not
-    // lastActivity: a connection stuck endlessly retransmitting its own
-    // close (a real symptom seen on real hardware) would otherwise refresh
-    // lastActivity on every single retry, meaning it would NEVER actually
-    // expire - and 16 slots (NAT_MAX_TCP_CONNECTIONS) fill up fast when a
-    // few connections get stuck like that while new ones keep opening.
+    // When the connection FIRST entered NAT_TCP_CLOSING/NAT_TCP_FIN_WAIT: set once and NEVER refreshed (unlike lastActivity, touched by every packet). natCleanupExpired times CLOSING/FIN_WAIT
+    // from this: a connection retransmitting its own close forever would refresh lastActivity on every retry and never expire, and the 16 slots (NAT_MAX_TCP_CONNECTIONS) fill fast when a few get stuck.
     unsigned long closingStartTime;
+
+    // Duplicate-ACK count for fast retransmit (natProcessTcp's ACK handling): the same cumulative ACK and window while data is outstanding means the Palm saw a gap.
+    uint8_t dupAcks;
+    uint16_t lastAckWindow;
+
+    // Palm -> server queue (PSRAM, NAT_TCP_TXQ_SIZE): what the Palm sent that the server socket has not taken. The loop never waits for the server: it queues, acks the Palm at once and
+    // drains the queue without blocking, so a slow WiFi moment cannot overflow the serial buffer.
+    uint8_t* txq;
+    uint32_t txqSize, txqHead, txqLen;
+    uint16_t lastAdvWindow;      // the window last advertised to the Palm (to send an update when it opens up)
 };
 
-// ============================================================================
-// NAT UDP Session Entry
-// ============================================================================
+// ---- NAT UDP Session Entry ----
 
 struct NatUdpEntry {
     bool active;
@@ -277,9 +190,7 @@ struct NatUdpEntry {
     unsigned long lastActivity;
 };
 
-// ============================================================================
-// NAT ICMP Session Entry
-// ============================================================================
+// ---- NAT ICMP Session Entry ----
 
 struct NatIcmpEntry {
     bool active;
@@ -292,9 +203,7 @@ struct NatIcmpEntry {
     unsigned long lastActivity;
 };
 
-// ============================================================================
-// Port Forward Entry
-// ============================================================================
+// ---- Port Forward Entry ----
 
 struct PortForwardEntry {
     bool active;
@@ -304,9 +213,7 @@ struct PortForwardEntry {
     uint16_t internalPort;  // Destination port
 };
 
-// ============================================================================
-// NAT Gateway Context
-// ============================================================================
+// ---- NAT Gateway Context ----
 
 struct NatContext {
     // IP Configuration (SLIP side)
@@ -323,15 +230,8 @@ struct NatContext {
     // Port forwarding rules
     PortForwardEntry portForwards[NAT_MAX_PORT_FORWARDS];
 
-    // UDP sockets for outbound NAT - one per active NatUdpEntry (indices
-    // match udpTable[]), each bound to that entry's own natPort. A single
-    // shared socket can't distinguish two entries active toward the same
-    // remote dst:port (e.g. an NTP retry opening a new entry before the
-    // prior attempt's entry expired) - a response would match whichever
-    // entry a lookup-by-remote-address found first, misdelivering it to the
-    // wrong client port. One socket per entry makes the socket itself the
-    // identity - whatever arrives on entry i's own socket unambiguously
-    // belongs to entry i, no address-based guessing.
+    // UDP sockets for outbound NAT, one per active NatUdpEntry (indices match udpTable[]), each bound to that entry's natPort. One shared socket could match a reply only by remote address
+    // and misdelivered it (e.g. an NTP retry opening a new entry before the old one expired). With one socket per entry, what arrives on entry i's socket belongs to entry i.
     WiFiUDP udpSockets[NAT_MAX_UDP_SESSIONS];
     bool udpSocketBound[NAT_MAX_UDP_SESSIONS];
 
@@ -351,11 +251,20 @@ struct NatContext {
     uint32_t tcpConnections;
     uint32_t udpSessions;
     uint32_t icmpPackets;
+
+    // Link-health counters for the SLIP stats line (slip_mode.cpp): what the Palm sent that did not survive, and how often the gateway had to send again.
+    uint32_t statIpBadCksum;     // IP header checksum mismatch (corrupted on the serial line)
+    uint32_t statTcpBadCksum;    // TCP checksum mismatch
+    uint32_t statOutOfSeq;       // client data segments dropped as out of sequence
+    uint32_t statRtoRewinds;     // retransmits after a timeout
+    uint32_t statFastRetx;       // retransmits after three duplicate ACKs
+    uint32_t statDupAcks;        // duplicate ACKs seen
+    uint32_t statPartialWrites;  // writes to the server that took less than the whole segment
+    uint32_t statQueueFull;      // Palm segments refused because the queue to the server was full
+    uint32_t statQueueMax;       // the most bytes the queue to the server held at once
 };
 
-// ============================================================================
-// IP Header Structure (20 bytes minimum)
-// ============================================================================
+// ---- IP Header Structure (20 bytes minimum) ----
 
 struct __attribute__((packed)) IpHeader {
     uint8_t  versionIhl;    // Version (4 bits) + IHL (4 bits)
@@ -370,9 +279,7 @@ struct __attribute__((packed)) IpHeader {
     uint32_t dstIP;         // Destination IP (big endian)
 };
 
-// ============================================================================
-// TCP Header Structure (20 bytes minimum)
-// ============================================================================
+// ---- TCP Header Structure (20 bytes minimum) ----
 
 struct __attribute__((packed)) TcpHeader {
     uint16_t srcPort;       // Source port (big endian)
@@ -386,9 +293,7 @@ struct __attribute__((packed)) TcpHeader {
     uint16_t urgentPtr;     // Urgent pointer
 };
 
-// ============================================================================
-// UDP Header Structure (8 bytes)
-// ============================================================================
+// ---- UDP Header Structure (8 bytes) ----
 
 struct __attribute__((packed)) UdpHeader {
     uint16_t srcPort;       // Source port (big endian)
@@ -397,9 +302,7 @@ struct __attribute__((packed)) UdpHeader {
     uint16_t checksum;      // Checksum
 };
 
-// ============================================================================
-// ICMP Header Structure
-// ============================================================================
+// ---- ICMP Header Structure ----
 
 struct __attribute__((packed)) IcmpHeader {
     uint8_t  type;          // Message type
@@ -413,9 +316,7 @@ struct __attribute__((packed)) IcmpHeader {
 #define ICMP_ECHO_REPLY     0
 #define ICMP_ECHO_REQUEST   8
 
-// ============================================================================
-// Function Declarations
-// ============================================================================
+// ---- Function Declarations ----
 
 // Initialize NAT context
 void natInit(NatContext* ctx);
@@ -435,20 +336,6 @@ void natProcessPendingIcmp(NatContext* ctx);
 
 // Clean up expired connections
 void natCleanupExpired(NatContext* ctx);
-
-// Port forwarding management
-int natAddPortForward(NatContext* ctx, uint8_t proto, uint16_t extPort,
-                      IPAddress intIP, uint16_t intPort, bool startServer = false);
-void natRemovePortForward(NatContext* ctx, int index);
-void natStartPortForwardServers(NatContext* ctx);
-void natStopPortForwardServers(NatContext* ctx);
-
-// Port forward persistence (EEPROM)
-void savePortForwards(NatContext* ctx);
-void loadPortForwards(NatContext* ctx);
-
-// Check for incoming port-forwarded connections
-void natCheckPortForwards(NatContext* ctx);
 
 // Utility functions
 uint16_t ipChecksum(const uint8_t* data, uint16_t length);

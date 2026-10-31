@@ -1,45 +1,29 @@
-// ============================================================================
-// SLIP Gateway Mode Implementation
-// ============================================================================
-// Mode handler for SLIP gateway functionality
-// ============================================================================
+// SLIP Gateway mode handler
 
 #include "slip_mode.h"
+#include "mode_exit.h"
 #include "globals.h"
+#include "settings.h"   // slipTimeoutMin
 #include "serial_io.h"
 #include "display_menu.h"
 #include "network.h"
 #include <EEPROM.h>
 
-// Result code for AT OK response (matches resultCodes_t enum in main.cpp)
-#define R_OK_STAT 0
-
-// Debug output support
 extern bool usbDebug;
 
-// ============================================================================
-// Global Contexts
-// ============================================================================
+// ---- Global contexts ----
 
 SlipContext slipCtx;
 NatContext natCtx;
 SlipModeContext slipModeCtx;
 
-// Menu definitions
-String slipMenuDisp[] = { "Main Menu", "Start Gateway", "Configure IP", "Port Forwards", "View Stats" };
-String slipActiveMenuDisp[] = { "Stop Gateway", "Show Status", "View Stats" };
-String portForwardMenuDisp[] = { "Back", "Add Forward", "Remove Forward", "List Forwards" };
-
-// showMenu()/showHeader() are declared in display_menu.h (already included
-// above) - a redundant local extern here would now mismatch that header's
-// signature (both gained a showWiRSaPrefix parameter).
+// showMenu()/showHeader() are declared in display_menu.h (included above); a local extern here would mismatch its signature (both gained a showWiRSaPrefix parameter).
 extern void showMessage(String message);
 extern void readSwitches();
 extern void waitSwitches();
 extern void mainMenu(bool arrow);
 
-// External globals
-extern Adafruit_SSD1306 display;
+extern WirsaDisplay display;
 extern int menuMode;
 extern int menuIdx;
 extern int menuCnt;
@@ -50,292 +34,216 @@ extern bool BTNDN;
 extern bool BTNEN;
 extern bool BTNBK;
 
-// Forward declarations for internal functions
-static void slipMenuLoop();
+// ---- link health, for the stats line ----
+// What the gateway saw on the Palm line: UART events (FIFO overflow and buffer-full lose bytes silently; the Arduino core's own warning is compiled out), how far behind the loop fell (bytes waiting
+// in the serial buffer) and the longest gap between two passes of the loop.
+static volatile uint32_t gUartOvf, gUartFull, gUartFrame, gUartBreak, gUartParity;
+static uint32_t gMaxBacklog, gMaxGapMs, gSlowPasses, gStatsPasses;
+static unsigned long gLastPassMs, gLastStatsMs, gLastTrafficMs;
+static uint32_t gStatFramesIn, gStatBytesIn, gStatFramesOut, gStatBytesOut, gStatTxMicros, gStatTxBytes;
+
+static void slipUartError(hardwareSerial_error_t e) {
+    switch (e) {
+        case UART_FIFO_OVF_ERROR:    gUartOvf++; break;
+        case UART_BUFFER_FULL_ERROR: gUartFull++; break;
+        case UART_FRAME_ERROR:       gUartFrame++; break;
+        case UART_BREAK_ERROR:       gUartBreak++; break;
+        case UART_PARITY_ERROR:      gUartParity++; break;
+        default: break;
+    }
+}
+
+static void slipStatsReset() {
+    gUartOvf = gUartFull = gUartFrame = gUartBreak = gUartParity = 0;
+    gMaxBacklog = gMaxGapMs = gSlowPasses = gStatsPasses = 0;
+    gLastPassMs = gLastStatsMs = millis();
+    gLastTrafficMs = 0;
+    gStatFramesIn = gStatBytesIn = gStatFramesOut = gStatBytesOut = gStatTxMicros = gStatTxBytes = 0;
+    slipTxMicros = slipTxBytes = 0;
+}
+
+// One line every 10 s while there is traffic and when the gateway stops. Compare with the line speed: "tx x%" is the share of the line rate the gateway's own sending reached (100 = back to back at full speed).
+static void slipLogStats(const char *why) {
+    unsigned long nowMs = millis();
+    uint32_t baud = PhysicalSerial.baudRate();
+    uint32_t txPct = 0;
+    if (slipTxMicros && baud) txPct = (uint32_t) ((uint64_t) slipTxBytes * 10ULL * 1000000ULL * 100ULL / ((uint64_t) slipTxMicros * baud));
+    LOGI("SLIP stats (%s) line %lu baud, pace %lu (slowed %lu x): in %lu fr/%lu B (slip err %lu, ip cksum %lu, tcp cksum %lu, out of seq %lu), "
+         "out %lu fr/%lu B (tx %lu%% of line)\r\n",
+         why, (unsigned long) baud, (unsigned long) slipPaceRate(), (unsigned long) slipPaceBackoffs(),
+         (unsigned long) slipCtx.framesReceived, (unsigned long) slipCtx.bytesReceived, (unsigned long) slipCtx.rxErrors,
+         (unsigned long) natCtx.statIpBadCksum, (unsigned long) natCtx.statTcpBadCksum, (unsigned long) natCtx.statOutOfSeq,
+         (unsigned long) slipCtx.framesSent, (unsigned long) slipCtx.bytesSent, (unsigned long) txPct);
+    LOGI("SLIP stats (%s) retransmit rto %lu / fast %lu, dup ack %lu, short write %lu, queue to server max %lu B full %lu, "
+         "uart ovf %lu full %lu frame %lu brk %lu par %lu, backlog max %lu B, loop gap max %lu ms (>50 ms: %lu of %lu)\r\n",
+         why, (unsigned long) natCtx.statRtoRewinds, (unsigned long) natCtx.statFastRetx, (unsigned long) natCtx.statDupAcks,
+         (unsigned long) natCtx.statPartialWrites, (unsigned long) natCtx.statQueueMax, (unsigned long) natCtx.statQueueFull,
+         (unsigned long) gUartOvf, (unsigned long) gUartFull, (unsigned long) gUartFrame, (unsigned long) gUartBreak,
+         (unsigned long) gUartParity, (unsigned long) gMaxBacklog, (unsigned long) gMaxGapMs,
+         (unsigned long) gSlowPasses, (unsigned long) gStatsPasses);
+    (void) nowMs;
+}
+
+// forward declarations
 static void slipActiveLoop();
 static void slipUpdateActiveDisplay();
 static bool parseIPAddress(const String& str, IPAddress& ip);
-static void slipAddPortForward();
-static void slipRemovePortForward();
-static void slipListPortForwards();
 
-// ============================================================================
-// SLIP Menu Function
-// ============================================================================
-
-void slipMenu(bool arrow) {
-    menuMode = MODE_SLIP;
-
-    if (slipModeCtx.state == SLIP_MODE_ACTIVE) {
-        // Show active gateway menu
-        showMenu("SLIP", slipActiveMenuDisp, 3, (arrow ? MENU_DISP : MENU_BOTH), 0);
-    } else {
-        // Show configuration menu
-        showMenu("SLIP", slipMenuDisp, 5, (arrow ? MENU_DISP : MENU_BOTH), 0);
-    }
-}
-
-// ============================================================================
-// SLIP Loop Function (Main Mode Handler)
-// ============================================================================
+// ---- SLIP loop (the mode handler) ----
 
 void slipLoop() {
     if (slipModeCtx.state == SLIP_MODE_ACTIVE) {
-        // Active SLIP gateway - process packets
         slipActiveLoop();
     } else {
-        // Menu mode
-        slipMenuLoop();
+        // There is no SLIP menu: MODE_SLIP exists only while the gateway runs. If this is reached without it, go back to the main menu rather than sit in a mode with no screen.
+        msgFlag = true;
+        mainMenu(false);
     }
 }
 
-// ============================================================================
-// SLIP Menu Loop (When Not Active)
-// ============================================================================
+// ---- SLIP active loop (gateway running) ----
 
-static void slipMenuLoop() {
-    int menuSel = -1;
+static void slipActiveLoop() {
+    {   // how late this pass is, and how much the serial buffer holds
+        unsigned long nowMs = millis();
+        unsigned long gap = nowMs - gLastPassMs;
+        gLastPassMs = nowMs;
+        gStatsPasses++;
+        if (gap > gMaxGapMs) gMaxGapMs = gap;
+        if (gap > 50) gSlowPasses++;
+        int backlog = PhysicalSerial.available();
+        if (backlog > 0 && (uint32_t) backlog > gMaxBacklog) gMaxBacklog = (uint32_t) backlog;
+        if (nowMs - gLastStatsMs >= 10000) {
+            gLastStatsMs = nowMs;
+            if (slipCtx.framesReceived != gStatFramesIn || slipCtx.framesSent != gStatFramesOut) {
+                slipLogStats("10 s");
+                gStatFramesIn = slipCtx.framesReceived; gStatFramesOut = slipCtx.framesSent;
+            }
+        }
+    }
 
-    readSwitches();
+    // BACK stops the gateway and returns to the main menu: the gateway starts from there and has no menu of its own.
+    if (ModeExit::backPressed()) {
+        LOGI("SLIP: stopped by the BACK button");
+        exitSlipMode();
+        ModeExit::toMenu();
+        return;
+    }
 
-    if (BTNUP) {
-        menuIdx--;
-        if (menuIdx < 0)
-            menuIdx = menuCnt - 1;
-        slipMenu(true);
+    if (BTNUP || BTNDN || BTNEN) {
+        waitSwitches();
+        // nothing to select: repaint the status screen
+        slipShowStatus();
     }
-    else if (BTNDN) {
-        menuIdx++;
-        if (menuIdx > (menuCnt - 1))
-            menuIdx = 0;
-        slipMenu(true);
+
+    // "+++" on the USB serial only: PhysicalSerial carries binary SLIP data that must not be read as commands
+    if (ModeExit::escapeTyped()) {
+        LOGI("SLIP: stopped by +++");
+        exitSlipMode();
+        ModeExit::toMenu();
+        return;
     }
-    else if (BTNEN) {
-        menuSel = menuIdx;
-    }
-    else if (BTNBK) {
+
+    // SLIP timeout (Config > Exit Timers): no traffic either way for that long (the Palm disconnected or never connected): stop the gateway and return to the main menu, as BACK. Frames sent to the Palm
+    // (WiFi-side replies) count too (slip.h).
+    if (!PhysicalSerial.available() &&
+        millis() - slipLastActivityMs > (unsigned long) slipTimeoutMin * 60000UL) {
+        LOGI("SLIP: no traffic for %u min - back to the main menu\r\n", (unsigned) slipTimeoutMin);
+        exitSlipMode();
+        msgFlag = true;
         mainMenu(false);
         return;
     }
 
-    waitSwitches();
-
-    // Read serial input
-    int serAvl = SerialAvailable();
-    char chr = 0;
-    if (serAvl > 0) {
-        chr = SerialRead();
-        SerialPrint(chr);
-    }
-
-    // Process selection
-    if (serAvl > 0 || menuSel > -1) {
-        if (chr == 'M' || chr == 'm' || menuSel == 0) {
-            // Return to main menu
-            mainMenu(false);
-        }
-        else if (chr == 'S' || chr == 's' || menuSel == 1) {
-            // Start SLIP Gateway
-            enterSlipMode();
-        }
-        else if (chr == 'C' || chr == 'c' || menuSel == 2) {
-            // Configure IP
-            slipConfigureIP();
-        }
-        else if (chr == 'P' || chr == 'p' || menuSel == 3) {
-            // Port Forwards
-            slipConfigurePortForward();
-        }
-        else if (chr == 'V' || chr == 'v' || menuSel == 4) {
-            // Statistics
-            slipShowStatistics();
-        }
-        else {
-            slipMenu(false);
-        }
-    }
-}
-
-// ============================================================================
-// SLIP Active Loop (When Gateway Running)
-// ============================================================================
-
-static void slipActiveLoop() {
-    // Check for button input to exit
-    readSwitches();
-
-    if (BTNBK) {
-        waitSwitches();
-        exitSlipMode();
-        // SLIP Gateway is only ever entered from its own top-level menu now
-        // (MODEM mode, the other historical entry point, is gone).
-        slipMenu(false);
-        return;
-    }
-
-    if (BTNUP || BTNDN) {
-        waitSwitches();
-        // Toggle status display
-        slipShowStatus();
-    }
-
-    if (BTNEN) {
-        waitSwitches();
-        // Show menu for active state
-        slipMenu(true);
-    }
-
-    // Check for escape commands on USB Serial ONLY (not PhysicalSerial)
-    // PhysicalSerial carries binary SLIP data that shouldn't be interpreted as commands
-    static char escapeBuffer[4] = {0};
-    static int escapePos = 0;
-    static unsigned long lastEscapeTime = 0;
-
-    while (Serial.available()) {
-        char c = Serial.read();
-
-        // Check for +++ escape sequence
-        if (c == '+') {
-            if (millis() - lastEscapeTime > 1000) {
-                escapePos = 0;
-            }
-            escapeBuffer[escapePos++] = c;
-            lastEscapeTime = millis();
-
-            if (escapePos >= 3) {
-                // Exit to command mode
-                SerialPrintLn("\r\nOK");
-                exitSlipMode();
-                slipMenu(false);
-                return;
-            }
-        } else {
-            escapePos = 0;
-        }
-    }
-
-    // Process incoming SLIP frames from PhysicalSerial only
+    // incoming SLIP frames from PhysicalSerial only
+    if (PhysicalSerial.available()) { slipLastActivityMs = millis(); gLastTrafficMs = slipLastActivityMs; }
     while (PhysicalSerial.available()) {
         uint8_t byte = PhysicalSerial.read();
         int frameLen = slipReceiveByte(&slipCtx, byte);
 
         if (frameLen > 0) {
-            // slipCtx.framesReceived is reset to 0 by slipInit() on every
-            // enterSlipMode() call, so ==1 here means this is genuinely the
-            // first complete frame seen THIS session - a clean, one-time
-            // "the vintage computer is actually talking to us" signal,
-            // distinct from any particular TCP/UDP connection succeeding or
-            // failing further down the stack. Answers "is a client
-            // connected at all" at the link layer before anything IP-level
-            // is even parsed.
-            if (usbDebug && slipCtx.framesReceived == 1) {
-                UsbDebugPrint("");
-                Serial.printf("SLIP: *** Client link UP - first frame received from vintage computer ***\r\n");
+            // slipCtx.framesReceived is reset by slipInit() on every enterSlipMode(), so == 1 is the first complete frame THIS session: a one-time "the vintage computer is talking to us" signal at the link
+            // layer, before anything IP-level is parsed and apart from any TCP/UDP connection succeeding or failing.
+            if (logOn(LOG_VERBOSE) && slipCtx.framesReceived == 1) {
+                logPrintf(LOG_VERBOSE, "SLIP: *** Client link UP - first frame received from vintage computer ***\r\n");
             }
-            // Complete IP packet received - process through NAT
-            if (usbDebug) {
-                UsbDebugPrint("");
-                Serial.printf("SLIP: Received frame, %d bytes\r\n", frameLen);
+            if (logOn(LOG_VERBOSE)) {
+                logPrintf(LOG_VERBOSE, "SLIP: Received frame, %d bytes\r\n", frameLen);
             }
             natProcessPacket(&natCtx, slipCtx.rxBuffer, frameLen);
         }
     }
 
-    // Poll NAT connections for incoming data from internet
+    // poll NAT connections for data from the internet
     natPollConnections(&natCtx);
 
-    // Check port forwards for incoming connections
-    natCheckPortForwards(&natCtx);
-
-    // Periodically clean up expired connections
+    // clean up expired connections periodically
     static unsigned long lastCleanup = 0;
     if (millis() - lastCleanup > 10000) {
         natCleanupExpired(&natCtx);
         lastCleanup = millis();
     }
 
-    // WiFi connectivity was previously only ever checked ONCE, at
-    // enterSlipMode() entry - if it dropped any time after that (AP reboot,
-    // DHCP lease loss, signal loss), nothing in the active loop noticed or
-    // logged it; every subsequent NAT forward attempt would just fail
-    // silently (or now, with the natProcessUdp/natProcessTcp checks, log a
-    // failure per-packet with no obvious common cause). Poll it here on a
-    // slow cadence and log only on a STATE CHANGE (not spammy every loop),
-    // plus a periodic reminder while it stays down, so "can't resolve
-    // anything" is immediately traceable to "gateway's own WiFi uplink is
-    // down" instead of looking like a SLIP/NAT bug.
+    // WiFi was checked only once, at enterSlipMode(): a later drop (AP reboot, DHCP lease loss, weak signal) went unnoticed and every NAT forward just failed (now logging per packet, with no obvious
+    // common cause). Poll it on a slow cadence and log only a STATE CHANGE, plus a periodic reminder while it stays down, so "can't resolve anything" traces to "the gateway's WiFi uplink is down", not a SLIP/NAT bug.
     static unsigned long lastWifiCheck = 0;
     static bool wifiWasConnected = true;  // assume true; enterSlipMode already verified it once
     static unsigned long wifiDownSince = 0;
     if (millis() - lastWifiCheck > 3000) {
         bool wifiConnected = (WiFi.status() == WL_CONNECTED);
         if (wifiConnected != wifiWasConnected) {
-            if (usbDebug) {
-                UsbDebugPrint("");
+            if (logOn(LOG_WARN)) {
                 if (!wifiConnected) {
-                    Serial.printf("NAT: *** WiFi uplink LOST (status=%d) - client requests will fail until it reconnects ***\r\n",
+                    logPrintf(LOG_WARN, "NAT: *** WiFi uplink LOST (status=%d) - client requests will fail until it reconnects ***\r\n",
                                   (int) WiFi.status());
                 } else {
-                    Serial.printf("NAT: WiFi uplink RESTORED, IP=%s\r\n", ipToString(WiFi.localIP()).c_str());
+                    logPrintf(LOG_WARN, "NAT: WiFi uplink RESTORED, IP=%s\r\n", ipToString(WiFi.localIP()).c_str());
                 }
             }
             if (!wifiConnected) wifiDownSince = millis();
             wifiWasConnected = wifiConnected;
         } else if (!wifiConnected && (millis() - wifiDownSince > 15000)) {
-            if (usbDebug) {
-                UsbDebugPrint("");
-                Serial.printf("NAT: WiFi uplink still down (%lus)\r\n", (millis() - wifiDownSince) / 1000);
+            if (logOn(LOG_VERBOSE)) {
+                logPrintf(LOG_VERBOSE, "NAT: WiFi uplink still down (%lus)\r\n", (millis() - wifiDownSince) / 1000);
             }
         }
         lastWifiCheck = millis();
     }
 
-    // Periodically update display
     static unsigned long lastDisplayUpdate = 0;
-    if (millis() - lastDisplayUpdate > 1000) {
+    // The OLED takes about 100 ms over I2C and would hold up the line while frames flow, so it refreshes only after the Palm side has been quiet for a second.
+    if (millis() - lastDisplayUpdate > 1000 && millis() - gLastTrafficMs > 1000) {
         slipUpdateActiveDisplay();
         lastDisplayUpdate = millis();
     }
 }
 
-// ============================================================================
-// Enter SLIP Gateway Mode
-// ============================================================================
+// ---- Enter SLIP Gateway mode ----
 
 void enterSlipMode() {
-    // Save previous mode to return to on disconnect
+    // remember the previous mode to return to
     slipModeCtx.previousMenuMode = menuMode;
 
-    // Switch to SLIP mode
     menuMode = MODE_SLIP;
 
-    // Enable binary mode - suppress text output to PhysicalSerial
-    // SLIP requires clean binary channel on RS232
+    // binary mode: SLIP needs a clean RS232 channel, no text output on PhysicalSerial
     setBinaryMode(true);
 
     SerialPrintLn("\r\nEntering SLIP Gateway Mode...");
 
-    // Load settings from EEPROM
     loadSlipSettings();
 
-    // Initialize SLIP context
     slipInit(&slipCtx);
 
-    // Initialize NAT context
     natInit(&natCtx);
 
-    // Apply loaded configuration
     natCtx.slipIP = slipModeCtx.config.slipIP;
     natCtx.clientIP = slipModeCtx.config.clientIP;
     natCtx.subnetMask = slipModeCtx.config.subnetMask;
     natCtx.dnsServer = slipModeCtx.config.dnsServer;
 
-    // Connect to WiFi if not already connected - waitForWiFiConnection()
-    // shows its own "Waiting for WiFi..." / "WiFi unavailable. Retry?" UI
-    // and retries for up to a minute; false means the user backed out with
-    // BACK, so undo the menuMode/binary-mode switch above and return to
-    // the main menu (SLIP's only real entry point) instead of leaving
-    // menuMode stuck on MODE_SLIP with nothing actually running.
+    // Connect to WiFi if not connected. waitForWiFiConnection() shows its own "Waiting for WiFi..." / "WiFi unavailable. Retry?" UI and retries for up to a minute; false means the user pressed BACK, so
+    // undo the menuMode and binary-mode switch above and return to the main menu (SLIP's only entry) rather than leave menuMode on MODE_SLIP with nothing running.
     if (WiFi.status() != WL_CONNECTED) {
         if (!waitForWiFiConnection()) {
             SerialPrintLn("SLIP Gateway: WiFi not available - cancelled.");
@@ -347,12 +255,15 @@ void enterSlipMode() {
     }
 
     slipModeCtx.state = SLIP_MODE_ACTIVE;
+    slipLastActivityMs = millis();   // the timeout counts from here
+    slipStatsReset();
+    slipPaceInit(PhysicalSerial.baudRate());
+    PhysicalSerial.onReceiveError(slipUartError);
+    // At 115200 the Arduino core lets the UART's 128-byte FIFO fill to 120 bytes before it asks for a read (about 1 ms of slack); wake the reader at 32 so a busy moment of WiFi or flash work cannot overflow it.
+    if (PhysicalSerial.baudRate() > 57600) PhysicalSerial.setRxFIFOFull(32);
+    LOGI("SLIP: mode entered - gateway %s, client %s, WiFi %s\r\n", ipToString(natCtx.slipIP).c_str(),
+         ipToString(natCtx.clientIP).c_str(), ipToString(WiFi.localIP()).c_str());
 
-    // Load port forwards from EEPROM and start servers
-    loadPortForwards(&natCtx);
-    natStartPortForwardServers(&natCtx);
-
-    // Display configuration
     SerialPrintLn("SLIP Gateway Active");
     SerialPrint("  Gateway IP: ");
     SerialPrintLn(ipToString(natCtx.slipIP));
@@ -365,20 +276,24 @@ void enterSlipMode() {
     slipShowStatus();
 }
 
-// ============================================================================
-// Exit SLIP Gateway Mode
-// ============================================================================
+// ---- Exit SLIP Gateway mode ----
 
 void exitSlipMode() {
-    // Disable binary mode - restore text output to PhysicalSerial
+    slipLogStats("exit");
+    PhysicalSerial.onReceiveError(NULL);
+    // binary mode off: text output to PhysicalSerial again
     setBinaryMode(false);
 
     SerialPrintLn("\r\nExiting SLIP Gateway Mode...");
+    LOGI("SLIP: mode exit - %lu frame(s) in / %lu out, %lu byte(s) in / %lu out, %lu TCP, %lu UDP, %lu ping(s), %lu dropped\r\n",
+         (unsigned long) slipCtx.framesReceived, (unsigned long) slipCtx.framesSent,
+         (unsigned long) slipCtx.bytesReceived, (unsigned long) slipCtx.bytesSent,
+         (unsigned long) natCtx.tcpConnections, (unsigned long) natCtx.udpSessions,
+         (unsigned long) natCtx.icmpPackets, (unsigned long) natCtx.droppedPackets);
 
-    // Shutdown NAT (closes all connections)
+    // shut down NAT (closes all connections)
     natShutdown(&natCtx);
 
-    // Reset SLIP state
     slipReset(&slipCtx);
 
     slipModeCtx.state = SLIP_MODE_IDLE;
@@ -386,14 +301,11 @@ void exitSlipMode() {
     SerialPrintLn("SLIP Gateway Stopped");
 }
 
-// ============================================================================
-// Show SLIP Status on Display
-// ============================================================================
+// ---- SLIP status on the display ----
 
 void slipShowStatus() {
     display.clearDisplay();
 
-    // Header
     display.fillRect(0, 0, 128, 16, SSD1306_WHITE);
     display.drawLine(1, 1, 126, 1, SSD1306_BLACK);
     display.drawLine(1, 14, 126, 14, SSD1306_BLACK);
@@ -402,10 +314,8 @@ void slipShowStatus() {
 
     display.setCursor(4, 4);
     display.setTextColor(SSD1306_BLACK);
-    // "SLIP" not "SLIP Gateway" to leave room for the WiFi status icon in
-    // this header. Live baud (not the configured showHeader() value)
-    // top-right, same as hotsync.cpp's hsDrawHeader()/sasd.cpp's
-    // sasdDrawStatusLines() - every title bar shows the active baud rate.
+    // "SLIP", not "SLIP Gateway", to leave room for the WiFi icon. The live baud (not the configured showHeader() value) is top right, as hotsync.cpp's hsDrawHeader() and sasd.cpp's sasdDrawStatusLines():
+    // every title bar shows the active rate.
     {
       String line = "SLIP";
       display.print(line);
@@ -413,7 +323,6 @@ void slipShowStatus() {
     }
     display.setTextColor(SSD1306_WHITE);
 
-    // Status info
     display.setCursor(3, 19);
     display.print("GW: ");
     display.print(ipToString(natCtx.slipIP));
@@ -426,7 +335,6 @@ void slipShowStatus() {
     display.print("WiFi: ");
     display.print(ipToString(WiFi.localIP()));
 
-    // Connection counts
     display.setCursor(3, 53);
     display.print("TCP:");
     display.print(natGetActiveTcpCount(&natCtx));
@@ -438,12 +346,10 @@ void slipShowStatus() {
     lastMenu = -1;  // Force menu redraw on exit
 }
 
-// ============================================================================
-// Update Active Display (Called Periodically)
-// ============================================================================
+// ---- Update the active display (called periodically) ----
 
 static void slipUpdateActiveDisplay() {
-    // Just update the connection counts
+    // only the connection counts
     display.fillRect(3, 53, 124, 10, SSD1306_BLACK);
     display.setCursor(3, 53);
     display.print("TCP:");
@@ -456,60 +362,21 @@ static void slipUpdateActiveDisplay() {
     display.display();
 }
 
-// ============================================================================
-// Show SLIP Statistics
-// ============================================================================
-
-void slipShowStatistics() {
-    SerialPrintLn("\r\n-=-=- SLIP Statistics -=-=-");
-    SerialPrint("SLIP Frames Received: ");
-    SerialPrintLn(slipCtx.framesReceived);
-    SerialPrint("SLIP Frames Sent:     ");
-    SerialPrintLn(slipCtx.framesSent);
-    SerialPrint("SLIP RX Errors:       ");
-    SerialPrintLn(slipCtx.rxErrors);
-    SerialPrintLn();
-    SerialPrint("Packets to Internet:  ");
-    SerialPrintLn(natCtx.packetsToInternet);
-    SerialPrint("Packets from Internet:");
-    SerialPrintLn(natCtx.packetsFromInternet);
-    SerialPrint("Dropped Packets:      ");
-    SerialPrintLn(natCtx.droppedPackets);
-    SerialPrintLn();
-    SerialPrint("Active TCP:           ");
-    SerialPrintLn(natGetActiveTcpCount(&natCtx));
-    SerialPrint("Active UDP:           ");
-    SerialPrintLn(natGetActiveUdpCount(&natCtx));
-    SerialPrint("Total TCP Connections:");
-    SerialPrintLn(natCtx.tcpConnections);
-    SerialPrint("Total UDP Sessions:   ");
-    SerialPrintLn(natCtx.udpSessions);
-    SerialPrintLn();
-
-    showMessage("Stats shown\non serial");
-    delay(1500);
-    slipMenu(false);
-}
-
-// ============================================================================
-// Load SLIP Settings from EEPROM
-// ============================================================================
+// ---- Load SLIP settings from EEPROM ----
 
 void loadSlipSettings() {
     uint8_t ip[4];
 
-    // Load Gateway IP
     for (int i = 0; i < 4; i++) {
         ip[i] = EEPROM.read(SLIP_IP_ADDRESS + i);
     }
     if (ip[0] == 255 || ip[0] == 0) {
-        // Invalid - use default
+        // invalid: use the default
         slipModeCtx.config.slipIP = IPAddress(192, 168, 7, 1);
     } else {
         slipModeCtx.config.slipIP = IPAddress(ip[0], ip[1], ip[2], ip[3]);
     }
 
-    // Load Client IP
     for (int i = 0; i < 4; i++) {
         ip[i] = EEPROM.read(SLIP_CLIENT_IP_ADDRESS + i);
     }
@@ -519,7 +386,6 @@ void loadSlipSettings() {
         slipModeCtx.config.clientIP = IPAddress(ip[0], ip[1], ip[2], ip[3]);
     }
 
-    // Load Subnet Mask
     for (int i = 0; i < 4; i++) {
         ip[i] = EEPROM.read(SLIP_SUBNET_ADDRESS + i);
     }
@@ -531,7 +397,6 @@ void loadSlipSettings() {
         slipModeCtx.config.subnetMask = IPAddress(ip[0], ip[1], ip[2], ip[3]);
     }
 
-    // Load DNS Server
     for (int i = 0; i < 4; i++) {
         ip[i] = EEPROM.read(SLIP_DNS_ADDRESS + i);
     }
@@ -544,27 +409,21 @@ void loadSlipSettings() {
     slipModeCtx.configChanged = false;
 }
 
-// ============================================================================
-// Save SLIP Settings to EEPROM
-// ============================================================================
+// ---- Save SLIP settings to EEPROM ----
 
 void saveSlipSettings() {
-    // Save Gateway IP
     for (int i = 0; i < 4; i++) {
         EEPROM.write(SLIP_IP_ADDRESS + i, slipModeCtx.config.slipIP[i]);
     }
 
-    // Save Client IP
     for (int i = 0; i < 4; i++) {
         EEPROM.write(SLIP_CLIENT_IP_ADDRESS + i, slipModeCtx.config.clientIP[i]);
     }
 
-    // Save Subnet Mask
     for (int i = 0; i < 4; i++) {
         EEPROM.write(SLIP_SUBNET_ADDRESS + i, slipModeCtx.config.subnetMask[i]);
     }
 
-    // Save DNS Server
     for (int i = 0; i < 4; i++) {
         EEPROM.write(SLIP_DNS_ADDRESS + i, slipModeCtx.config.dnsServer[i]);
     }
@@ -573,343 +432,75 @@ void saveSlipSettings() {
     slipModeCtx.configChanged = false;
 }
 
-// ============================================================================
-// Configure IP Addresses - Wizard Style
-// ============================================================================
+// ---- SLIP setup (Config menu): Gateway IP, Client IP, DNS Server ----
 
-void slipConfigureIP() {
-    loadSlipSettings();  // Load current settings
+// One address prompt, pre-filled with the current value; digits and '.' only. False if the user cancelled (the caller saves nothing). An entry that is not a usable address is refused and asked again.
+static bool slipPromptIP(const char *title, IPAddress& ip) {
+    char buf[16];
+    while (true) {
+        String cur = ipToString(ip);
+        strncpy(buf, cur.c_str(), sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        if (!charEntryPrompt(title, buf, 15, "0123456789."))
+            return false;
 
-    SerialPrintLn("\r\n-=-=- SLIP IP Configuration Wizard -=-=-");
-    SerialPrintLn("Press Enter to keep current value, or type new value");
-    SerialPrintLn();
+        IPAddress entered;
+        // A first octet of 0 or 255 is what loadSlipSettings() reads as "not set" and silently replaces with the default, so refuse it here.
+        if (parseIPAddress(String(buf), entered) && entered[0] != 0 && entered[0] != 255) {
+            ip = entered;
+            return true;
+        }
+        SerialPrintLn("\r\nInvalid IP address");
+        showMessage("\n  Invalid IP");
+        delay(1500);
+    }
+}
 
-    // Prompt for Gateway IP
-    String gatewayPrompt = "Gateway IP: ";
-    String currentGateway = ipToString(slipModeCtx.config.slipIP);
-    String newGateway = prompt(gatewayPrompt, currentGateway);
+// Called from the Config menu (settingsLoop(), display_menu.cpp), which redraws itself afterwards. The gateway cannot be running (it is left only via BACK to the main menu) and reads these values each time it starts (enterSlipMode()).
+void slipSetup() {
+    loadSlipSettings();
+    IPAddress gateway = slipModeCtx.config.slipIP;
+    IPAddress client = slipModeCtx.config.clientIP;
+    IPAddress dns = slipModeCtx.config.dnsServer;
 
-    IPAddress newGatewayIP;
-    if (newGateway != "" && parseIPAddress(newGateway, newGatewayIP)) {
-        slipModeCtx.config.slipIP = newGatewayIP;
-        SerialPrintLn("Gateway IP updated");
-    } else if (newGateway != currentGateway && newGateway != "") {
-        SerialPrintLn("Invalid IP format - keeping current");
+    if (!slipPromptIP("Gateway IP", gateway)) return;
+    while (true) {
+        IPAddress entered = client;
+        if (!slipPromptIP("Client IP", entered)) return;
+        if (!(entered == gateway)) {
+            client = entered;
+            break;
+        }
+        SerialPrintLn("\r\nClient IP must differ from Gateway IP");
+        showMessage("\nClient must\ndiffer from GW");
+        delay(1500);
+    }
+    if (!slipPromptIP("DNS Server", dns)) return;
+
+    if (gateway == slipModeCtx.config.slipIP && client == slipModeCtx.config.clientIP &&
+        dns == slipModeCtx.config.dnsServer) {
+        SerialPrintLn("\r\nSLIP settings unchanged");
+        return;
     }
 
-    // Prompt for Client IP
-    String clientPrompt = "Client IP: ";
-    String currentClient = ipToString(slipModeCtx.config.clientIP);
-    String newClient = prompt(clientPrompt, currentClient);
-
-    IPAddress newClientIP;
-    if (newClient != "" && parseIPAddress(newClient, newClientIP)) {
-        slipModeCtx.config.clientIP = newClientIP;
-        SerialPrintLn("Client IP updated");
-    } else if (newClient != currentClient && newClient != "") {
-        SerialPrintLn("Invalid IP format - keeping current");
-    }
-
-    // Prompt for DNS Server
-    String dnsPrompt = "DNS Server: ";
-    String currentDNS = ipToString(slipModeCtx.config.dnsServer);
-    String newDNS = prompt(dnsPrompt, currentDNS);
-
-    IPAddress newDNSIP;
-    if (newDNS != "" && parseIPAddress(newDNS, newDNSIP)) {
-        slipModeCtx.config.dnsServer = newDNSIP;
-        SerialPrintLn("DNS server updated");
-    } else if (newDNS != currentDNS && newDNS != "") {
-        SerialPrintLn("Invalid IP format - keeping current");
-    }
-
-    // Save settings
-    SerialPrintLn("\r\nSaving settings to EEPROM...");
+    slipModeCtx.config.slipIP = gateway;
+    slipModeCtx.config.clientIP = client;
+    slipModeCtx.config.dnsServer = dns;
     saveSlipSettings();
-    SerialPrintLn("Configuration saved!");
 
-    // Display summary
-    SerialPrintLn("\r\nNew Configuration:");
+    SerialPrintLn("\r\nSLIP settings saved:");
     SerialPrint("  Gateway IP: ");
-    SerialPrintLn(ipToString(slipModeCtx.config.slipIP));
+    SerialPrintLn(ipToString(gateway));
     SerialPrint("  Client IP:  ");
-    SerialPrintLn(ipToString(slipModeCtx.config.clientIP));
+    SerialPrintLn(ipToString(client));
     SerialPrint("  DNS Server: ");
-    SerialPrintLn(ipToString(slipModeCtx.config.dnsServer));
+    SerialPrintLn(ipToString(dns));
 
-    showMessage("Config saved!\nSee serial");
-    delay(2000);
-    slipMenu(false);
-}
-
-// ============================================================================
-// Configure Port Forwards - Submenu
-// ============================================================================
-
-void slipConfigurePortForward() {
-    // Load port forwards from EEPROM
-    loadPortForwards(&natCtx);
-
-    // Show submenu
-    SerialPrintLn("\r\n-=-=- Port Forwarding Menu -=-=-");
-    SerialPrintLn("[A]dd Forward");
-    SerialPrintLn("[R]emove Forward");
-    SerialPrintLn("[L]ist Forwards");
-    SerialPrintLn("[B]ack");
-    SerialPrintLn();
-    SerialPrint("> ");
-
-    showMessage("Port Fwd Menu\nSee serial");
-
-    // Wait for single keypress
-    while (SerialAvailable() == 0) {
-        delay(10);
-    }
-    char chr = SerialRead();
-    SerialPrintLn(chr);  // Echo the character
-
-    if (chr == 'A' || chr == 'a') {
-        slipAddPortForward();
-    }
-    else if (chr == 'R' || chr == 'r') {
-        slipRemovePortForward();
-    }
-    else if (chr == 'L' || chr == 'l') {
-        slipListPortForwards();
-    }
-    else {
-        // Back or invalid - return to SLIP menu
-        slipMenu(false);
-    }
-}
-
-// ============================================================================
-// Add Port Forward - Wizard
-// ============================================================================
-
-static void slipAddPortForward() {
-    loadSlipSettings();  // Ensure we have current settings
-
-    SerialPrintLn("\r\n-=-=- Add Port Forward -=-=-");
-    SerialPrintLn();
-
-    // Prompt for protocol (TCP or UDP)
-    String protoPrompt = "Protocol (TCP/UDP): ";
-    String protoStr = prompt(protoPrompt, "TCP");
-    protoStr.toUpperCase();
-
-    if (protoStr != "TCP" && protoStr != "UDP") {
-        SerialPrintLn("Invalid protocol - must be TCP or UDP");
-        showMessage("Invalid\nprotocol");
-        delay(1500);
-        slipConfigurePortForward();
-        return;
-    }
-
-    uint8_t proto = (protoStr == "TCP") ? IP_PROTO_TCP : IP_PROTO_UDP;
-
-    // Prompt for external port
-    String extPortPrompt = "External Port (on ESP32): ";
-    String extPortStr = prompt(extPortPrompt, "");
-
-    if (extPortStr == "") {
-        SerialPrintLn("Canceled");
-        showMessage("Canceled");
-        delay(1000);
-        slipConfigurePortForward();
-        return;
-    }
-
-    uint16_t extPort = extPortStr.toInt();
-    if (extPort < 1 || extPort > 65535) {
-        SerialPrintLn("Invalid port number");
-        showMessage("Invalid port");
-        delay(1500);
-        slipConfigurePortForward();
-        return;
-    }
-
-    // Prompt for internal IP (default to client IP)
-    String intIPPrompt = "Internal IP: ";
-    String currentClient = ipToString(slipModeCtx.config.clientIP);
-    String intIPStr = prompt(intIPPrompt, currentClient);
-
-    IPAddress intIP;
-    if (!parseIPAddress(intIPStr, intIP)) {
-        SerialPrintLn("Invalid IP format");
-        showMessage("Invalid IP");
-        delay(1500);
-        slipConfigurePortForward();
-        return;
-    }
-
-    // Prompt for internal port
-    String intPortPrompt = "Internal Port (on client): ";
-    String intPortStr = prompt(intPortPrompt, extPortStr);  // Default to same as external
-
-    if (intPortStr == "") {
-        SerialPrintLn("Canceled");
-        showMessage("Canceled");
-        delay(1000);
-        slipConfigurePortForward();
-        return;
-    }
-
-    uint16_t intPort = intPortStr.toInt();
-    if (intPort < 1 || intPort > 65535) {
-        SerialPrintLn("Invalid port number");
-        showMessage("Invalid port");
-        delay(1500);
-        slipConfigurePortForward();
-        return;
-    }
-
-    // Add the forward
-    int idx = natAddPortForward(&natCtx, proto, extPort, intIP, intPort);
-
-    if (idx >= 0) {
-        // Save to EEPROM
-        savePortForwards(&natCtx);
-
-        SerialPrintLn("\r\nPort forward added:");
-        SerialPrint("  ");
-        SerialPrint(protoStr);
-        SerialPrint(" ");
-        SerialPrint(extPort);
-        SerialPrint(" -> ");
-        SerialPrint(ipToString(intIP));
-        SerialPrint(":");
-        SerialPrintLn(intPort);
-
-        showMessage("Forward\nadded!");
-        delay(1500);
-    } else {
-        SerialPrintLn("Failed to add forward - table full");
-        showMessage("Table full!\nRemove some");
-        delay(2000);
-    }
-
-    slipConfigurePortForward();
-}
-
-// ============================================================================
-// Remove Port Forward - Wizard
-// ============================================================================
-
-static void slipRemovePortForward() {
-    SerialPrintLn("\r\n-=-=- Remove Port Forward -=-=-");
-    SerialPrintLn("Active port forwards:");
-
-    int count = 0;
-    for (int i = 0; i < NAT_MAX_PORT_FORWARDS; i++) {
-        if (natCtx.portForwards[i].active) {
-            SerialPrint("  ");
-            SerialPrint(i);
-            SerialPrint(": ");
-            SerialPrint(natCtx.portForwards[i].protocol == IP_PROTO_TCP ? "TCP" : "UDP");
-            SerialPrint(" ");
-            SerialPrint(natCtx.portForwards[i].externalPort);
-            SerialPrint(" -> ");
-            SerialPrint(ipToString(natCtx.portForwards[i].internalIP));
-            SerialPrint(":");
-            SerialPrintLn(natCtx.portForwards[i].internalPort);
-            count++;
-        }
-    }
-
-    if (count == 0) {
-        SerialPrintLn("  (none configured)");
-        showMessage("No forwards\nto remove");
-        delay(1500);
-        slipConfigurePortForward();
-        return;
-    }
-
-    SerialPrintLn();
-    SerialPrint("Index to remove (0-7, B=back): ");
-
-    // Wait for single keypress
-    while (SerialAvailable() == 0) {
-        delay(10);
-    }
-    char chr = SerialRead();
-    SerialPrintLn(chr);  // Echo the character
-
-    if (chr == 'B' || chr == 'b') {
-        slipConfigurePortForward();
-        return;
-    }
-
-    int idx = chr - '0';
-    if (idx < 0 || idx >= NAT_MAX_PORT_FORWARDS || !natCtx.portForwards[idx].active) {
-        SerialPrintLn("Invalid index");
-        showMessage("Invalid index");
-        delay(1500);
-        slipConfigurePortForward();
-        return;
-    }
-
-    natRemovePortForward(&natCtx, idx);
-
-    // Save to EEPROM
-    savePortForwards(&natCtx);
-
-    SerialPrintLn("Port forward removed");
-    showMessage("Forward\nremoved!");
+    showMessage("\n SLIP config\n    saved");
     delay(1500);
-
-    slipConfigurePortForward();
 }
 
-// ============================================================================
-// List Port Forwards
-// ============================================================================
-
-static void slipListPortForwards() {
-    SerialPrintLn("\r\n-=-=- Port Forwarding -=-=-");
-    SerialPrintLn("Active port forwards:");
-
-    int count = 0;
-    for (int i = 0; i < NAT_MAX_PORT_FORWARDS; i++) {
-        if (natCtx.portForwards[i].active) {
-            SerialPrint("  ");
-            SerialPrint(i);
-            SerialPrint(": ");
-            SerialPrint(natCtx.portForwards[i].protocol == IP_PROTO_TCP ? "TCP" : "UDP");
-            SerialPrint(" ");
-            SerialPrint(natCtx.portForwards[i].externalPort);
-            SerialPrint(" -> ");
-            SerialPrint(ipToString(natCtx.portForwards[i].internalIP));
-            SerialPrint(":");
-            SerialPrintLn(natCtx.portForwards[i].internalPort);
-            count++;
-        }
-    }
-
-    if (count == 0) {
-        SerialPrintLn("  (none configured)");
-    }
-
-    showMessage("Forwards shown\non serial");
-    delay(2000);
-    slipConfigurePortForward();
-}
-
-// ============================================================================
-// Set Default SLIP Configuration
-// ============================================================================
-
-void slipDefaultConfig() {
-    slipModeCtx.config.slipIP = IPAddress(192, 168, 7, 1);
-    slipModeCtx.config.clientIP = IPAddress(192, 168, 7, 2);
-    slipModeCtx.config.subnetMask = IPAddress(255, 255, 255, 0);
-    slipModeCtx.config.dnsServer = IPAddress(8, 8, 8, 8);
-    slipModeCtx.configChanged = true;
-}
-
-// ============================================================================
-// Parse IP Address from String
-// ============================================================================
+// ---- Parse an IP address from a string ----
 
 static bool parseIPAddress(const String& str, IPAddress& ip) {
     int parts[4];
@@ -933,127 +524,4 @@ static bool parseIPAddress(const String& str, IPAddress& ip) {
 
     ip = IPAddress(parts[0], parts[1], parts[2], parts[3]);
     return true;
-}
-
-// ============================================================================
-// Handle SLIP AT Commands
-// ============================================================================
-
-bool handleSlipCommand(String& cmd, String& upCmd) {
-    // AT$SLIP - Enter SLIP mode
-    if (upCmd == "ATSLIP" || upCmd == "AT$SLIP") {
-        enterSlipMode();
-        return true;
-    }
-
-    // AT$SLIPSTAT - Show statistics
-    if (upCmd == "AT$SLIPSTAT") {
-        slipShowStatistics();
-        return true;
-    }
-
-    // AT$SLIPIP=x.x.x.x - Set gateway IP
-    if (upCmd.startsWith("AT$SLIPIP=")) {
-        String ipStr = cmd.substring(10);
-        IPAddress newIP;
-        if (parseIPAddress(ipStr, newIP)) {
-            slipModeCtx.config.slipIP = newIP;
-            slipModeCtx.configChanged = true;
-            SerialPrintLn("Gateway IP set to " + ipToString(newIP));
-            return true;
-        } else {
-            SerialPrintLn("Invalid IP format");
-            return true;
-        }
-    }
-
-    // AT$SLIPCLIENT=x.x.x.x - Set client IP
-    if (upCmd.startsWith("AT$SLIPCLIENT=")) {
-        String ipStr = cmd.substring(14);
-        IPAddress newIP;
-        if (parseIPAddress(ipStr, newIP)) {
-            slipModeCtx.config.clientIP = newIP;
-            slipModeCtx.configChanged = true;
-            SerialPrintLn("Client IP set to " + ipToString(newIP));
-            return true;
-        } else {
-            SerialPrintLn("Invalid IP format");
-            return true;
-        }
-    }
-
-    // AT$SLIPDNS=x.x.x.x - Set DNS server
-    if (upCmd.startsWith("AT$SLIPDNS=")) {
-        String ipStr = cmd.substring(11);
-        IPAddress newIP;
-        if (parseIPAddress(ipStr, newIP)) {
-            slipModeCtx.config.dnsServer = newIP;
-            slipModeCtx.configChanged = true;
-            SerialPrintLn("DNS server set to " + ipToString(newIP));
-            return true;
-        } else {
-            SerialPrintLn("Invalid IP format");
-            return true;
-        }
-    }
-
-    // AT$SLIPFWD=TCP,extport,intport - Add port forward
-    if (upCmd.startsWith("AT$SLIPFWD=")) {
-        String params = cmd.substring(11);
-        // Parse: TCP,80,8080 or UDP,53,53
-        int comma1 = params.indexOf(',');
-        int comma2 = params.indexOf(',', comma1 + 1);
-
-        if (comma1 > 0 && comma2 > comma1) {
-            String protoStr = params.substring(0, comma1);
-            protoStr.toUpperCase();
-            uint16_t extPort = params.substring(comma1 + 1, comma2).toInt();
-            uint16_t intPort = params.substring(comma2 + 1).toInt();
-
-            uint8_t proto = (protoStr == "TCP") ? IP_PROTO_TCP : IP_PROTO_UDP;
-
-            int idx = natAddPortForward(&natCtx, proto, extPort,
-                                        slipModeCtx.config.clientIP, intPort);
-            if (idx >= 0) {
-                SerialPrint("Port forward added: ");
-                SerialPrint(protoStr);
-                SerialPrint(" ");
-                SerialPrint(extPort);
-                SerialPrint(" -> ");
-                SerialPrint(ipToString(slipModeCtx.config.clientIP));
-                SerialPrint(":");
-                SerialPrintLn(intPort);
-            } else {
-                SerialPrintLn("Failed - table full");
-            }
-            return true;
-        } else {
-            SerialPrintLn("Format: AT$SLIPFWD=TCP,extport,intport");
-            return true;
-        }
-    }
-
-    // AT$SLIPFWDDEL=index - Remove port forward
-    if (upCmd.startsWith("AT$SLIPFWDDEL=")) {
-        int idx = cmd.substring(14).toInt();
-        natRemovePortForward(&natCtx, idx);
-        SerialPrintLn("Port forward removed");
-        return true;
-    }
-
-    // AT$SLIPSHOW - Show current configuration
-    if (upCmd == "AT$SLIPSHOW") {
-        SerialPrintLn("\r\n-=-=- SLIP Configuration -=-=-");
-        SerialPrint("Gateway IP: ");
-        SerialPrintLn(ipToString(slipModeCtx.config.slipIP));
-        SerialPrint("Client IP:  ");
-        SerialPrintLn(ipToString(slipModeCtx.config.clientIP));
-        SerialPrint("Subnet:     ");
-        SerialPrintLn(ipToString(slipModeCtx.config.subnetMask));
-        SerialPrint("DNS Server: ");
-        SerialPrintLn(ipToString(slipModeCtx.config.dnsServer));
-        return true;
-    }
-
-    return false;  // Command not handled
 }

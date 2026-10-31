@@ -3,34 +3,23 @@
 
 #include <Arduino.h>
 
-// ============================================================================
-// HotSync Install mode
-// ============================================================================
-// Wire-compatible (not code-ported) with dmitry.gr's real SASD project's own
-// embedded HotSync host client (~/Downloads/sasdSource/SASD_release/software/
-// serialSD/firmware/hotsync.c + prc.c + slk.c + frag.c). WiRSa plays the
-// desktop-cradle role: it waits for a Palm's HotSync WAKE packet, negotiates
-// a session over the real DLP/PADP/SLP wire protocol, then pushes every
-// .PRC/.PDB file it finds in two SD-card folders onto the device, and ends
-// the sync - no desktop computer involved. Full design/rationale in
-// ~/WiRSa/HOTSYNC_PLAN.md.
-//
-// Repurposes the MODE_FILE slot (see globals.h) that used to be "File
-// Transfer" (XMODEM/YMODEM/ZMODEM over modem.cpp/file_transfer.cpp) - same
-// "repurpose an existing mode slot" approach already used once for SASD
-// (MODE_PLAYBACK). File Transfer's own code (fileMenu/fileLoop/protocolMenu/
-// listFilesMenu in modem.cpp/display_menu.cpp, plus all of file_transfer.cpp
-// itself) was confirmed unreachable from the main menu once this was wired
-// in, and has since been removed outright - only zmCRC16Update() (now in
-// main.cpp/globals.h) survived, since sasd.cpp/hotsync.cpp both still use
-// it for their own shared slk-layer CRC.
-// ============================================================================
+// ---- HotSync Install mode ----
+// Wire-compatible (not a code port) with the embedded HotSync host client of dmitry.gr's SASD project (hotsync.c, prc.c, slk.c, frag.c). WiRSa plays the desktop cradle: it waits for a Palm's HotSync
+// WAKE, negotiates a session over the real DLP/PADP/SLP protocol, pushes every .PRC/.PDB in two folders of the selected disk (the SD card or the virtual card, per the Disk setting) to the device, and
+// ends the sync, with no desktop computer. Use: docs/README-Palm.md. Design: apps/WiRSa-Palm.md.
+// It reuses the MODE_FILE slot (globals.h), once "File Transfer" (XMODEM/YMODEM/ZMODEM), as SASD reused MODE_PLAYBACK. File Transfer's code was unreachable and is removed; only zmCRC16Update() (now
+// main.cpp/globals.h) survives, for sasd.cpp and hotsync.cpp's slk-layer CRC.
 
-// Menu loop function (called from main.cpp's loop() when in MODE_FILE)
+// menu loop (called from main.cpp's loop() in MODE_FILE)
 void hotsyncLoop();
 
-// Enter HotSync mode - entering the menu item IS the on/off mechanism, same
-// as every other mode; no separate config step (nothing to configure).
+// Enter HotSync mode: entering the menu item is the on/off, as every mode; nothing to configure.
 void enterHotsyncMode();
+
+// Choose and mount the disk HotSync installs from (the Disk setting) and create its install folders. Call before enterHotsyncMode(); false when there is no disk.
+bool hotsyncPrepareDisk();
+
+// Leave HotSync if it is still waiting for the Palm (BOOT button).
+void hotsyncCancelWait();
 
 #endif // HOTSYNC_H

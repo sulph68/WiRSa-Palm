@@ -1,19 +1,18 @@
-// WiFi Setup Wizard
-// Provides user-friendly WiFi network configuration
+// WiFi Setup wizard: guided WiFi network configuration
 
 #include "Arduino.h"
 #include "wifi_setup.h"
 #include "globals.h"
+#include "palm_ctl.h"   // menuKey()
 #include "display_menu.h"
 #include "serial_io.h"
 #include "settings.h"
-#include "network.h"   // wifiBeginConnect()/wifiReconnectToSaved() - single WiFi.begin() entry point
+#include "network.h"  // wifiBeginConnect()/wifiReconnectToSaved(): the one WiFi.begin() entry point
 #include <WiFi.h>
 #include <EEPROM.h>
 #include <Adafruit_SSD1306.h>
 
-// External globals
-extern Adafruit_SSD1306 display;
+extern WirsaDisplay display;
 extern int menuMode;
 extern int menuIdx;
 extern int menuCnt;
@@ -24,19 +23,16 @@ extern String password;
 extern byte serialSpeed;
 extern String baudDisp[];
 
-// Button state
 extern bool BTNUP;
 extern bool BTNDN;
 extern bool BTNEN;
 extern bool BTNBK;
 
-// WiFi setup context
 WifiSetupContext wifiSetupCtx;
 
-// Network list storage
 static String networkList[WIFI_MAX_NETWORKS];
 
-// Character set for password entry (printable ASCII)
+// character set for password entry (printable ASCII)
 static const char CHAR_SET[] = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 static const int CHAR_SET_LEN = sizeof(CHAR_SET) - 1;
 
@@ -50,9 +46,8 @@ void wifiSetupInit() {
   memset(wifiSetupCtx.tempPassword, 0, sizeof(wifiSetupCtx.tempPassword));
 }
 
-// Display detailed network information after successful connection
+// details of the network after a successful connection
 void wifiShowConnectionInfo() {
-  // Serial output - detailed info
   SerialPrintLn("\r\n===== WiFi Connected =====");
   SerialPrintLn("SSID:    " + WiFi.SSID());
   SerialPrintLn("IP:      " + WiFi.localIP().toString());
@@ -64,7 +59,7 @@ void wifiShowConnectionInfo() {
   SerialPrintLn("MAC:     " + WiFi.macAddress());
   SerialPrintLn("==========================");
 
-  // OLED display - show key info (limited space)
+  // OLED: the key information (little space)
   display.fillRect(1, 17, 125, 46, SSD1306_BLACK);
   display.setTextColor(SSD1306_WHITE);
   display.setTextWrap(false);
@@ -97,7 +92,7 @@ void wifiScanNetworks() {
   SerialPrintLn("\r\nScanning for WiFi networks...");
   showMessage("Scanning\nfor WiFi\nnetworks...");
 
-  // Disconnect from current network for clean scan
+  // drop the current network for a clean scan
   wifiDisconnect();
   delay(100);
 
@@ -113,7 +108,6 @@ void wifiScanNetworks() {
     SerialPrintLn("\r\n" + String(wifiSetupCtx.networkCount) + " networks found:");
 
     for (int i = 0; i < wifiSetupCtx.networkCount; i++) {
-      // Build display string with signal strength indicator
       String rssiStr;
       int rssi = WiFi.RSSI(i);
       if (rssi > -50) rssiStr = "****";
@@ -121,7 +115,7 @@ void wifiScanNetworks() {
       else if (rssi > -70) rssiStr = "**  ";
       else rssiStr = "*   ";
 
-      // Truncate SSID for display (max 12 chars to leave room for signal)
+      // SSID truncated for display (12 chars, leaving room for the signal)
       String ssidName = WiFi.SSID(i);
       if (ssidName.length() > 18) {
         ssidName = ssidName.substring(0, 17) + "~";
@@ -129,7 +123,6 @@ void wifiScanNetworks() {
 
       networkList[i] = ssidName + " " + rssiStr;
     }
-    // Add Cancel option after the networks
     if (wifiSetupCtx.networkCount < WIFI_MAX_NETWORKS) {
       networkList[wifiSetupCtx.networkCount] = "Cancel";
     }
@@ -142,11 +135,10 @@ void wifiSetupMenu(bool arrow) {
   menuMode = MODE_WIFI_SETUP;
 
   if (wifiSetupCtx.networkCount == 0) {
-    // No networks - show rescan option
     static String noNetOptions[] = { "Rescan", "Back" };
     showMenu("WIFI", noNetOptions, 2, (arrow ? MENU_DISP : MENU_BOTH), 0);
   } else {
-    // +1 for the Cancel option at the end
+    // +1 for the Cancel option
     int totalItems = wifiSetupCtx.networkCount + 1;
     showMenu("WIFI", networkList, totalItems, (arrow ? MENU_DISP : MENU_NUM), 0);
   }
@@ -155,10 +147,8 @@ void wifiSetupMenu(bool arrow) {
 void wifiPasswordMenu() {
   menuMode = MODE_WIFI_PASSWORD;
 
-  // Clear display area
   display.fillRect(1, 17, 125, 46, SSD1306_BLACK);
 
-  // Draw header showing selected network
   display.setCursor(3, 19);
   display.setTextColor(SSD1306_WHITE);
   display.print("Password for:");
@@ -170,13 +160,11 @@ void wifiPasswordMenu() {
   }
   display.print(dispSSID);
 
-  // Draw password entry area
   display.drawLine(1, 38, 126, 38, SSD1306_WHITE);
 
-  // Show current password with cursor
   display.setCursor(3, 41);
 
-  // Display password (show last 17 chars if longer)
+  // the password (the last 17 chars if longer)
   String pwdDisplay = String(wifiSetupCtx.tempPassword);
   int startPos = 0;
   if (pwdDisplay.length() > 16) {
@@ -185,13 +173,12 @@ void wifiPasswordMenu() {
   }
   display.print(pwdDisplay.substring(startPos));
 
-  // Show current character being selected (blinking cursor position)
+  // the character being selected (blinking cursor position)
   if (wifiSetupCtx.passwordPos < WIFI_PASSWORD_MAX) {
     display.print(wifiSetupCtx.currentChar);
     display.print("_");
   }
 
-  // Instructions at bottom
   display.setCursor(3, 49);
   display.setTextSize(1);
   display.print("UD:chr EN:add BK:del");
@@ -202,7 +189,6 @@ void wifiPasswordMenu() {
 }
 
 void wifiSetupLoop() {
-  // Handle initial scan
   if (wifiSetupCtx.state == WIFI_STATE_SCAN) {
     wifiScanNetworks();
     wifiSetupMenu(false);
@@ -228,21 +214,19 @@ void wifiSetupLoop() {
     menuSel = menuIdx;
   }
   else if (BTNBK) {
-    // Reconnect to original network if we have credentials
+    // back to the original network if there are credentials
     wifiReconnectToSaved();
     settingsMenu(false);
     return;
   }
   waitSwitches();
 
-  // Serial input
-  int serAvl = SerialAvailable();
   char chr = 0;
+  int serAvl = menuKey(chr);   // burst-guarded Palm-line key, or a control frame (palm_ctl.h)
   if (serAvl > 0) {
-    chr = SerialRead();
     SerialPrint(chr);
 
-    // Handle letter selection (A-? for networks + Cancel)
+    // letter selection (A-? for the networks, then Cancel)
     if (wifiSetupCtx.networkCount > 0) {
       int totalItems = wifiSetupCtx.networkCount + 1; // +1 for Cancel
       if ((chr >= 'A' && chr < 'A' + totalItems) ||
@@ -251,7 +235,6 @@ void wifiSetupLoop() {
         menuSel = chr - 'A';
       }
     } else {
-      // No networks - handle rescan/back
       if (chr == 'R' || chr == 'r') {
         wifiSetupCtx.state = WIFI_STATE_SCAN;
         wifiSetupLoop();
@@ -265,31 +248,24 @@ void wifiSetupLoop() {
     }
   }
 
-  // Handle selection
   if (menuSel >= 0) {
     if (wifiSetupCtx.networkCount == 0) {
-      // No networks menu
       if (menuSel == 0) {
-        // Rescan
         wifiSetupCtx.state = WIFI_STATE_SCAN;
         wifiSetupLoop();
       } else {
-        // Back
         wifiReconnectToSaved();
         settingsMenu(false);
       }
     } else if (menuSel == wifiSetupCtx.networkCount) {
-      // Cancel selected - go back
       wifiReconnectToSaved();
       settingsMenu(false);
     } else {
-      // Network selected - get the actual SSID (not the display string)
+      // network selected: take the real SSID (not the display string)
       wifiSetupCtx.selectedNetwork = menuSel;
       wifiSetupCtx.selectedSSID = WiFi.SSID(menuSel);
 
-      // Check if open network
       if (WiFi.encryptionType(menuSel) == WIFI_AUTH_OPEN) {
-        // Open network - connect directly
         SerialPrintLn("\r\nConnecting to open network: " + wifiSetupCtx.selectedSSID);
         showMessage("Connecting\nto open\nnetwork...");
 
@@ -302,7 +278,6 @@ void wifiSetupLoop() {
           SerialPrintLn("\r\nConnection failed.");
         }
 
-        // Wait for keypress then return to settings
         while (!BTNEN && !BTNBK && SerialAvailable() == 0) {
           readSwitches();
           delay(50);
@@ -311,7 +286,6 @@ void wifiSetupLoop() {
         while (SerialAvailable()) SerialRead();
         settingsMenu(false);
       } else {
-        // Secured network - enter password mode
         wifiSetupCtx.state = WIFI_STATE_PASSWORD;
         wifiSetupCtx.passwordPos = 0;
         wifiSetupCtx.currentChar = 'a';
@@ -327,17 +301,14 @@ void wifiSetupLoop() {
   }
 }
 
-// Auto-repeat timing
 static unsigned long btnHoldStart = 0;
 static unsigned long lastRepeat = 0;
 static bool btnWasPressed = false;
 
-// Enter long-press timing
 static unsigned long enterHoldStart = 0;
 static bool enterWasPressed = false;
 static unsigned long enterReleaseTime = 0; // Debounce: when ENTER was last released
 
-// Auto-repeat constants
 #define REPEAT_DELAY 400    // Initial delay before repeat starts (ms)
 #define REPEAT_RATE 80      // Rate of repeat while held (ms)
 #define LONG_PRESS_MS 1000  // Hold ENTER for 1 second to submit password
@@ -353,15 +324,12 @@ void wifiPasswordLoop() {
     bool shouldUpdate = false;
 
     if (!btnWasPressed) {
-      // First press - always update
       btnHoldStart = now;
       lastRepeat = now;
       btnWasPressed = true;
       shouldUpdate = true;
     } else {
-      // Button held - check for auto-repeat
       if (now - btnHoldStart > REPEAT_DELAY) {
-        // Past initial delay, check repeat rate
         if (now - lastRepeat > REPEAT_RATE) {
           lastRepeat = now;
           shouldUpdate = true;
@@ -371,7 +339,6 @@ void wifiPasswordLoop() {
 
     if (shouldUpdate) {
       if (BTNUP) {
-        // Previous character in set
         const char* pos = strchr(CHAR_SET, wifiSetupCtx.currentChar);
         if (pos) {
           int idx = pos - CHAR_SET;
@@ -381,7 +348,6 @@ void wifiPasswordLoop() {
           wifiSetupCtx.currentChar = 'a';
         }
       } else {
-        // Next character in set
         const char* pos = strchr(CHAR_SET, wifiSetupCtx.currentChar);
         if (pos) {
           int idx = pos - CHAR_SET;
@@ -394,22 +360,21 @@ void wifiPasswordLoop() {
       wifiPasswordMenu();
     }
   } else {
-    // No up/down pressed - reset hold state
     btnWasPressed = false;
   }
 
   if (BTNEN) {
     if (!enterWasPressed) {
-      // First detection of ENTER press - start timing (with debounce check)
+      // first ENTER press: start timing (debounced)
       if (millis() - enterReleaseTime >= ENTER_DEBOUNCE_MS) {
         enterHoldStart = millis();
         enterWasPressed = true;
       }
     } else if (millis() - enterHoldStart >= LONG_PRESS_MS) {
-      // Long press threshold reached - submit password immediately
+      // long press: submit the password at once
       enterWasPressed = false;
 
-      // Include the currently displayed character in the password
+      // include the character on display
       if (wifiSetupCtx.passwordPos < WIFI_PASSWORD_MAX) {
         wifiSetupCtx.tempPassword[wifiSetupCtx.passwordPos] = wifiSetupCtx.currentChar;
         wifiSetupCtx.passwordPos++;
@@ -439,7 +404,6 @@ void wifiPasswordLoop() {
       settingsMenu(false);
       return;
     } else if (millis() - enterHoldStart > 300) {
-      // Visual feedback - show they're holding
       display.fillRect(1, 49, 125, 14, SSD1306_BLACK);
       display.setCursor(3, 53);
       display.print("Connecting...");
@@ -447,7 +411,7 @@ void wifiPasswordLoop() {
     }
   }
   else if (enterWasPressed) {
-    // ENTER released before long press - short press, add character
+    // short press: add the character
     enterWasPressed = false;
     enterReleaseTime = millis(); // Record release time for debounce
     if (wifiSetupCtx.passwordPos < WIFI_PASSWORD_MAX) {
@@ -459,15 +423,13 @@ void wifiPasswordLoop() {
     wifiPasswordMenu();
   }
   else if (BTNBK) {
-    // Delete last character or go back
     if (wifiSetupCtx.passwordPos > 0) {
       wifiSetupCtx.passwordPos--;
       wifiSetupCtx.tempPassword[wifiSetupCtx.passwordPos] = '\0';
-      // Erase character on serial (backspace, space, backspace)
+      // erase on serial (backspace, space, backspace)
       SerialPrint("\b \b");
       wifiPasswordMenu();
     } else {
-      // Go back to network selection
       wifiSetupCtx.state = WIFI_STATE_SELECT;
       wifiSetupMenu(false);
       return;
@@ -475,13 +437,12 @@ void wifiPasswordLoop() {
     waitSwitches();
   }
 
-  // Serial input - direct password typing
+  // direct password typing over serial
   int serAvl = SerialAvailable();
   if (serAvl > 0) {
     char chr = SerialRead();
 
     if (chr == '\r' || chr == '\n') {
-      // Submit password
       SerialPrintLn("\r\n\r\nConnecting to: " + wifiSetupCtx.selectedSSID);
       showMessage("Connecting\nto network\n\nPlease wait...");
 
@@ -494,7 +455,6 @@ void wifiPasswordLoop() {
         SerialPrintLn("\r\nConnection failed. Wrong password?");
       }
 
-      // Wait for keypress
       delay(200);
       while (!BTNEN && !BTNBK && SerialAvailable() == 0) {
         readSwitches();
@@ -505,28 +465,24 @@ void wifiPasswordLoop() {
       settingsMenu(false);
     }
     else if (chr == 0x08 || chr == 0x7F) {
-      // Backspace/Delete
       if (wifiSetupCtx.passwordPos > 0) {
         wifiSetupCtx.passwordPos--;
         wifiSetupCtx.tempPassword[wifiSetupCtx.passwordPos] = '\0';
-        // Echo backspace
         SerialPrint("\b \b");
       }
       wifiPasswordMenu();
     }
-    else if (chr == 0x1B) {
-      // Escape - go back
+    else if (chr == 0x1B || chr == 0x16) {
+      // Escape: go back. 0x16 starts a Palm control frame (palm_ctl.cpp): leave the password prompt rather than type its bytes in; the menu's burst guard drains the rest.
       wifiSetupCtx.state = WIFI_STATE_SELECT;
       wifiSetupMenu(false);
     }
     else if (chr >= 32 && chr < 127) {
-      // Printable character - add to password
       if (wifiSetupCtx.passwordPos < WIFI_PASSWORD_MAX) {
         wifiSetupCtx.tempPassword[wifiSetupCtx.passwordPos] = chr;
         wifiSetupCtx.passwordPos++;
         wifiSetupCtx.tempPassword[wifiSetupCtx.passwordPos] = '\0';
         wifiSetupCtx.currentChar = chr; // Update current char to last typed
-        // Echo the character
         SerialPrint(String(chr));
       }
       wifiPasswordMenu();
@@ -540,7 +496,6 @@ bool wifiTestConnection(const char* testSsid, const char* testPassword) {
 
   wifiBeginConnect(testSsid, testPassword);
 
-  // Wait up to 15 seconds for connection
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
@@ -553,11 +508,9 @@ bool wifiTestConnection(const char* testSsid, const char* testPassword) {
 }
 
 void wifiSaveCredentials(const char* newSsid, const char* newPassword) {
-  // Update global variables
   ssid = String(newSsid);
   password = String(newPassword);
 
-  // Save to EEPROM
   for (int i = 0; i < 32; i++) {
     if (i < strlen(newSsid))
       EEPROM.write(SSID_ADDRESS + i, newSsid[i]);
