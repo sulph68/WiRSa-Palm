@@ -26,12 +26,14 @@ adds only its own frames and work.
   | `drainAtEntry` | throw away stale bytes already on the port |
   | `probeType`, `sessionActive`, `lastFrameAt`, `busy` | the silence probe (below); leave `probeType` 0 and the rest empty and the mode ends on the Exit Timers alone |
   | `helloAckType`, `helloVersion`, `helloServer` | the HELLO reply: its frame type, protocol version and server name (`WiRSa-DAV/2`, `WiRSa-BW/2`, `WiRSa-Mesh/3`) |
+  | `helloConfirm` | the confirmed baud switch (set at entry by CalDAV, BitWarden and Mesh): the port moves on the Palm's second HELLO, not right after the reply |
 
   `enter`, `leave`, `leaveToMenu`, `tick`, `readFrame`, `handleHello`, `dispatch` and `agreedBaud` do the rest. `tick` runs the BACK button, the `+++` escape on USB,
   WiRSaCtl's EXIT, the Exit Timers, the WiFi wait and the negotiated-rate watchdog, and says whether the mode was left (`Left`), has nothing to do (`Wait`)
   or should carry on (`Go`). `readFrame` returns the next frame of the mode's own protocol and filters out WiRSaCtl's frames and the serial-link
   key exchange. `handleHello` answers the Palm's HELLO the same way in every relay: it agrees the speed (never above the configured one), sends
-  `version u8, capabilities u8, name str, rate u32`, and moves the port to the agreed rate.
+  `version u8, capabilities u8, name str, rate u32`, and moves the port to the agreed rate. A mode with `helloConfirm` set (CalDAV, BitWarden, Mesh) moves it only when the Palm
+  has confirmed it read the reply (Protocol-wire.md 5.1, `include/hello_confirm.h`).
 - **The silence probe** (`Spec.probeType`), for a mode whose session stays open for hours (Mesh): before a session begins, the "unused" Exit Timer;
   during it, after the *After session* time without a frame from the Palm the skeleton sends the probe frame (a PING) and leaves only if nothing
   arrives within the same time again. Any frame clears it. `busy()` (a node operation, a dialog open on the Palm) counts as activity. BitWarden

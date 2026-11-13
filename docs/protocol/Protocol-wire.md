@@ -104,6 +104,23 @@ WiRSa -> HELLO_ACK  version u8, caps u8, server str, baud u32
 - A `HELLO` with a short body is ignored and gets no reply (an old Palm build).
 - BitWarden and CalDAV: a rate that was negotiated and then never used (no request within 15 s) is given up and WiRSa goes back to 9600.
 
+**The confirmed switch (CalDAV, BitWarden and Mesh; `RelayMode::helloConfirm`, `include/hello_confirm.h`).** The reply is sent once and the port moves right after it, so a reply
+that is lost or damaged on the way leaves WiRSa at the new rate and the Palm at 9600 until WiRSa's 15 s watchdog gives up. HotSync does it the other way round:
+the new rate is used only after the other end has acknowledged. CalDAV does the same, with the optional flags byte after the rate:
+
+```
+Palm  -> HELLO      baud u32, flags u8 = 0x01 (OFFER)     I will confirm before I switch
+WiRSa -> HELLO_ACK  version, caps = 0x02, server, baud    at the idle rate; the port has not moved
+Palm  -> HELLO      baud u32, flags u8 = 0x02 (CONFIRM)   the reply was read; still at the idle rate, the same rate again
+                    both ends now move to `baud`
+```
+
+- A reply the Palm could not read: the Palm waits 250 ms, flushes its input and sends a new HELLO (up to 3). WiRSa answers each, and the port has not moved.
+  The Palm tries again only when the failure came quickly; a reply that never came took the whole idle wait already.
+- WiRSa forgets an offer that is not confirmed within 5 s, and ignores a CONFIRM with no open offer, or for another rate.
+- Compatibility: an older WiRSa reads the rate only, replies with `caps` 0 and moves at once, and a Palm that sees `caps` without bit 0x02 moves at once too.
+  An older Palm sends no flags byte and gets the old behaviour.
+
 ### 5.2 Acknowledged frames
 
 A frame that carries data the receiver must keep is **acknowledged** with an empty-body frame, and the next one is not sent before it arrives
@@ -427,11 +444,11 @@ Notes (`palm_ctl.cpp`):
 - **Passwords** are never returned: `CFG_GET` has only the two `passSet` bits.
 
 `CFG_GET` reply: `baud u8, logLevel u8, orientation u8, ftpUser str, apSsid str, slipIp[4], clientIp[4], subnet[4], dns[4], passSet u8`, then, appended later (an app stops reading where its shape ends):
-`unusedExitSec u8, afterExitSec u8, slipTimeoutMin u8, sasdDisk u8, deepSleepMin u8, sasdTimeoutMin u8`. `baud` is the Palm link's rate number: 4 = 9600, 9 = 14400, 5 = 19200, 10 = 28800, 6 = 38400, 7 = 57600, 8 = 115200
+`unusedExitSec u8, afterExitSec u8, slipTimeoutMin u8, sasdDisk u8, deepSleepMin u8, sasdTimeoutMin u8, wifiPulse u8`. `baud` is the Palm link's rate number: 4 = 9600, 9 = 14400, 5 = 19200, 10 = 28800, 6 = 38400, 7 = 57600, 8 = 115200
 (a request with 0-3 becomes 9600). `logLevel`: 0 off, 1 info, 2 warn, 3 verbose. `orientation`: 0 normal, 1 flipped. `passSet`: bit 0 FTP password set, bit 1 AP password set.
 
 `CFG_SET` request: `baud u8, logLevel u8, orientation u8, ftpUser str, apSsid str`, 16 IP bytes (the same four addresses; `passSet` is not sent), then the same appended tail, each field present only if the body goes on.
-Valid values: `slipTimeoutMin` 1, 2, 3 or 5; `sasdDisk` 0 auto, 1 SD card, 2 virtual card; `deepSleepMin` 0, 1, 3, 5 or 15; `sasdTimeoutMin` 3, 5, 10 or 15 (an invalid value is ignored). A body shorter than the fixed part gets ERR bad request.
+Valid values: `slipTimeoutMin` 1, 2, 3 or 5; `sasdDisk` 0 auto, 1 SD card, 2 virtual card; `deepSleepMin` 0, 1, 3, 5 or 15; `sasdTimeoutMin` 3, 5, 10 or 15; `wifiPulse` 0 always on, 1 every 15 s, 2 every 30 s, 3 every minute, 4 never (the blue LED, `README-Palm.md` "Status LED") (an invalid value is ignored). A body shorter than the fixed part gets ERR bad request.
 
 ## 13. Writing a client, and writing a relay
 

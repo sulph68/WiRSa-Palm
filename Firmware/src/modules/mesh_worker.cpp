@@ -90,8 +90,6 @@ bool drainRadio(unsigned long maxMs) {
       LOGI("Mesh: routing answer from %08lx for packet %lu: error %u", (unsigned long) fr.packet.from, (unsigned long) fr.packet.requestId, (unsigned) fr.packet.routeError);
     else if (fr.kind == MeshPb::K_PACKET && fr.packet.decoded && fr.packet.port == MeshPb::PORT_TEXT)
       LOGI("Mesh: text from %08lx on channel %u, %u bytes", (unsigned long) fr.packet.from, (unsigned) fr.packet.channel, (unsigned) fr.packet.payloadLen);
-    if (menuMode == MODE_MESH && fr.kind == MeshPb::K_PACKET && fr.packet.decoded && (fr.packet.port == MeshPb::PORT_ROUTING || fr.packet.port == MeshPb::PORT_TEXT))
-      ledActivity(LED_ACT_TEXT);                                                 // a text or an acknowledgement: the longer blink
     CoreLock lk;
     MeshCore::onFromRadio(fr, utcNow());
     if (fr.kind == MeshPb::K_CONFIG_DONE)
@@ -174,7 +172,6 @@ void runCmd(Cmd &c) {
     case W_SEND: {
       bool ok = MeshBle::connected() && sendToRadio(c.data, c.len);
       LOGI("Mesh: message %lu %s", (unsigned long) c.id, ok ? "written to the node" : "NOT written (no link or the write failed)");
-      if (ok && menuMode == MODE_MESH) ledActivity(LED_ACT_TEXT);
       { CoreLock lk; MeshCore::textWritten(c.id, ok); }
       SendRes &r = gSendRes[gSendHead % 6];
       r.localId = c.lid; r.id = c.id; r.ok = ok; r.code = MeshCore::ERR_WRITE;

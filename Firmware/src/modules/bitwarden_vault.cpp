@@ -362,12 +362,69 @@ bool bwProcessOneCipher(const String &itemJson, JsonDocument &filter,
   return true;
 }
 
+// The ciphers array when a server lists it before "folders" and "profile" (newer Vaultwarden lists the keys alphabetically): the text is held in PSRAM, as it arrives, and
+// walked once the others are in. Grows by half each time, so a vault of a few MB is a handful of reallocations, not one per byte.
+static const size_t kMaxHeldCiphers = 6UL * 1024 * 1024;
+
+struct HeldJson {
+  char *p = nullptr;
+  size_t n = 0, cap = 0;
+  ~HeldJson() { release(); }
+  void release() { if (p) { heap_caps_free(p); p = nullptr; } n = cap = 0; }
+  bool put(char c) {
+    if (n == cap) {
+      size_t nc = cap ? cap + cap / 2 : 128 * 1024;
+      if (nc > kMaxHeldCiphers) nc = kMaxHeldCiphers;
+      if (nc <= cap) return false;                                                   // the cap
+      char *q = (char *) heap_caps_realloc(p, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!q) return false;                                                          // no PSRAM left (p is still valid and freed by release())
+      p = q; cap = nc;
+    }
+    p[n++] = c;
+    return true;
+  }
+};
+
+// Copies the array at the next non-whitespace byte into h, verbatim. False if it is not an array, ends early, or does not fit.
+static bool bwHoldJsonArray(BwJsonScanner &sc, HeldJson &h) {
+  int c = sc.nextNonWs();
+  if (c != '[') return false;
+  int depth = 0;
+  bool inStr = false, esc = false;
+  unsigned long n = 0;
+  for (;;) {
+    if (!h.put((char) c)) return false;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == '"') inStr = false;
+    } else if (c == '"') inStr = true;
+    else if (c == '[' || c == '{') depth++;
+    else if (c == ']' || c == '}') { if (--depth == 0) return true; }
+    if ((++n & 0x3FFF) == 0) yield();                                                // a few MB: keep WiFi and the watchdog serviced
+    c = sc.next();
+    if (c < 0) return false;
+  }
+}
+
+// The held text as a Stream, for the same scanner the live response goes through.
+struct HeldStream : public Stream {
+  const char *p; size_t n, i = 0;
+  HeldStream(const char *text, size_t len) : p(text), n(len) {}
+  int available() override { return (int) (n - i); }
+  int read() override { return i < n ? (uint8_t) p[i++] : -1; }
+  int peek() override { return i < n ? (uint8_t) p[i] : -1; }
+  size_t readBytes(char *buf, size_t len) override { size_t k = n - i < len ? n - i : len; memcpy(buf, p + i, k); i += k; return k; }
+  size_t write(uint8_t) override { return 0; }
+};
+
 static const int kMaxSyncFolders = 64;
 static const int kMaxSyncOrgs = 16;
 
 // One forward pass over the top-level /api/sync object. folders and profile.organizations must be seen (and their id-to-index maps built) before ciphers, which reference them
-// by GUID, and a live stream cannot seek back. Vaultwarden puts profile and folders before ciphers (the official SyncResponseModel's order), and this fails loudly with a clear error
-// if a server build does not, rather than emit wrong folderIndex/orgIndex.
+// by GUID, and a live stream cannot seek back. The official SyncResponseModel's order has profile and folders before ciphers and that is streamed as it arrives. A server that lists
+// ciphers first (newer Vaultwarden, alphabetical keys) has the array held in PSRAM (HeldJson, at most kMaxHeldCiphers) and walked after the others, so no wrong folderIndex/orgIndex
+// is ever emitted; if folders or profile never come, or the array does not fit, the sync fails with a clear error.
 // skipFolders/skipOrgs/skipCiphers: how many elements of each array were already forwarded and acked by the Palm in a PRIOR attempt of this same sync (see bwHandleSync's retry loop);
 // 0/0/0 on the first. itemCount/folderCount/orgCount belong to the CALLER and are not reset here: they keep accumulating across retries as the totals reported in SYNC_DONE and as the stable
 // send-index of each folder/org (a retry must give the same folders/orgs the same indices, since already-sent ciphers reference them).
@@ -382,7 +439,34 @@ bool bwStreamSyncBody(Stream &s, const uint8_t userEncKey[32], const uint8_t use
   String privateKeyEnc;	/* profile.privateKey, raw (still-quoted) JSON text - unwrapped once profile parsing finishes */
   for (int i = 0; i < kMaxSyncOrgs; i++) gOrgKeys[i].valid = false;
   bool sawFolders = false, sawProfile = false;
+  String keysSeen;   // the top-level keys met so far, for the message when "ciphers" comes before the ones it needs
   BwJsonScanner sc(s);
+  HeldJson held;
+  bool heldCiphers = false;
+
+  // The ciphers array, from the live response or from the held text: each cipher is decrypted and handed on.
+  auto doCiphers = [&](BwJsonScanner &cs) -> bool {
+    LOGV("BW: [t+%lums] streaming ciphers...\r\n", millis() - tSyncStart);
+    JsonDocument cipherFilter;
+    bwBuildCipherFilter(cipherFilter);
+    // elemIndex/skipCiphers: the same retry-resume shape as folders and orgs, but it skips the whole bwProcessOneCipher call, not only the send: decrypting a cipher is real work,
+    // unlike a folder or org name. Correct while the retried /api/sync returns the same items in the same order, which holds in the seconds-long window of a retry.
+    // skipCiphers is advanced per item, right after each is confirmed; once after the array would leave it stale on a mid-array ack failure, and a retry would re-decrypt and re-send confirmed items.
+    int elemIndex = 0;
+    bool arrOk = bwStreamArray(cs, [&](String &itemJson) -> bool {
+      if (elemIndex < (int) skipCiphers) { elemIndex++; return true; }
+      bool itemOk = bwProcessOneCipher(itemJson, cipherFilter, userEncKey, userMacKey, gFolderIds, folderCount, gOrgIds, orgCount,
+                                        gOrgKeys, itemCount, errOut, errCode);
+      elemIndex++;
+      if (itemOk) skipCiphers = (uint16_t) elemIndex;
+      return itemOk;
+    });
+    if (!arrOk) {
+      if (errCode == 0) { errCode = BW_ERR_SYNC_FETCH_FAILED; errOut = "malformed ciphers array"; }
+      return false;
+    }
+    return true;
+  };
 
   // errOut/errCode are shared with bwHandleSync's login retry loop (bwLogin legitimately sets errCode = BW_ERR_TWO_FACTOR_REQUIRED on its first, expected-to-fail attempt):
   // reset them so the "if (errCode == 0) generic message" checks below do not mistake a stale value for one set here.
@@ -422,6 +506,7 @@ bool bwStreamSyncBody(Stream &s, const uint8_t userEncKey[32], const uint8_t use
       key += (char) e;
     }
     if (sc.nextNonWs() != ':') { errCode = BW_ERR_SYNC_FETCH_FAILED; errOut = "malformed sync JSON (expected ':')"; return false; }
+    if (keysSeen.length() < 120) { if (keysSeen.length()) keysSeen += ','; keysSeen += key.substring(0, 24); }
 
     if (key == "folders") {
       // elemIndex: the position within THIS attempt's array walk, reset on every call (folderCount persists across retries as the stable send-index). Folders before skipFolders were
@@ -576,27 +661,16 @@ bool bwStreamSyncBody(Stream &s, const uint8_t userEncKey[32], const uint8_t use
       privateKeyEnc = String();	/* private key material - don't linger in RAM longer than needed */
     } else if (key == "ciphers") {
       if (!sawFolders || !sawProfile) {
-        errCode = BW_ERR_SYNC_FETCH_FAILED;
-        errOut = "sync response has 'ciphers' before 'folders'/'profile' - unsupported key order";
-        return false;
-      }
-      LOGV("BW: [t+%lums] streaming ciphers...\r\n", millis() - tSyncStart);
-      JsonDocument cipherFilter;
-      bwBuildCipherFilter(cipherFilter);
-      // elemIndex/skipCiphers: the same retry-resume shape as folders and orgs, but it skips the whole bwProcessOneCipher call, not only the send: decrypting a cipher is real work,
-      // unlike a folder or org name. Correct while the retried /api/sync returns the same items in the same order, which holds in the seconds-long window of a retry.
-      // skipCiphers is advanced per item, right after each is confirmed; once after the array would leave it stale on a mid-array ack failure, and a retry would re-decrypt and re-send confirmed items.
-      int elemIndex = 0;
-      bool arrOk = bwStreamArray(sc, [&](String &itemJson) -> bool {
-        if (elemIndex < (int) skipCiphers) { elemIndex++; return true; }
-        bool itemOk = bwProcessOneCipher(itemJson, cipherFilter, userEncKey, userMacKey, gFolderIds, folderCount, gOrgIds, orgCount,
-                                          gOrgKeys, itemCount, errOut, errCode);
-        elemIndex++;
-        if (itemOk) skipCiphers = (uint16_t) elemIndex;
-        return itemOk;
-      });
-      if (!arrOk) {
-        if (errCode == 0) { errCode = BW_ERR_SYNC_FETCH_FAILED; errOut = "malformed ciphers array"; }
+        // Listed before the keys it needs: hold the array and walk it after them (below the loop).
+        LOGI("BW: [t+%lums] 'ciphers' comes before 'folders'/'profile' - holding it in PSRAM until they are in\r\n", millis() - tSyncStart);
+        if (!bwHoldJsonArray(sc, held)) {
+          errCode = BW_ERR_SYNC_FETCH_FAILED;
+          errOut = "the ciphers could not be held (" + String((unsigned) held.n) + " bytes read, PSRAM free " + String((unsigned) ESP.getFreePsram()) + ")";
+          return false;
+        }
+        LOGI("BW: [t+%lums] held %u bytes of ciphers (PSRAM free %u)\r\n", millis() - tSyncStart, (unsigned) held.n, (unsigned) ESP.getFreePsram());
+        heldCiphers = true;
+      } else if (!doCiphers(sc)) {
         return false;
       }
     } else {
@@ -611,6 +685,18 @@ bool bwStreamSyncBody(Stream &s, const uint8_t userEncKey[32], const uint8_t use
     if (sep == ',') continue;
     if (sep == '}') break;
     errCode = BW_ERR_SYNC_FETCH_FAILED; errOut = "malformed sync JSON (top-level separator)"; return false;
+  }
+
+  if (heldCiphers) {
+    if (!sawFolders || !sawProfile) {
+      errCode = BW_ERR_SYNC_FETCH_FAILED;
+      errOut = "sync response lacks 'folders'/'profile' (keys seen: " + keysSeen + ")";
+      return false;
+    }
+    HeldStream hs(held.p, held.n);
+    BwJsonScanner hsc(hs);
+    if (!doCiphers(hsc)) return false;
+    held.release();
   }
 
   return true;

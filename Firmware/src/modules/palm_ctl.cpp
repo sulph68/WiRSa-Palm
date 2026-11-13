@@ -553,6 +553,7 @@ void cfgGet() {
   w.u8(sasdDiskMode);        // SASD disk: 0 auto, 1 SD card, 2 virtual card - and this one
   w.u8(deepSleepMin);        // deep sleep delay, minutes (0 off) - and this one
   w.u8(sasdTimeoutMin);      // SASD timeout, minutes (3, 5, 10, 15) - and this one
+  w.u8(wifiPulse);           // WiFi pulse: 0 always on, 1 15 s, 2 30 s, 3 1 min, 4 never - and this one
   reply((uint8_t) (CTL_CFG_GET + 0x20), gOut, w.len);
 }
 
@@ -589,6 +590,10 @@ void cfgSet(size_t len) {
   if (r.pos + 1 <= r.len) {   // SASD timeout, minutes - optional tail
     uint8_t m = r.u8();
     if (sasdTimeoutValid(m)) sasdTimeoutMin = m;
+  }
+  if (r.pos + 1 <= r.len) {   // WiFi pulse - optional tail
+    uint8_t m = r.u8();
+    if (wifiPulseValid(m)) wifiPulse = m;
   }
 
   logSetLevel(logLevelFromWire(usb));

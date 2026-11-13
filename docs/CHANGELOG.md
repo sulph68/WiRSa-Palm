@@ -17,7 +17,8 @@ This fork against the original [nullvalue0/WiRSa](https://github.com/nullvalue0/
 - Background WiFi connect and reconnect, with a live signal-strength icon on every title bar.
 - Per-feature compile-time switches (`WIRSA_FEATURE_*`) for a trimmed-down firmware.
 - **Boards:** the LilyGO T7-S3 (`WIRSA_BOARD_T7S3`) and a plain ESP32-S3 board with the OLED, built with its own flags (PSRAM, the 16 MB partition table, NimBLE); deep sleep is opt-in there (`-DWIRSA_DEEP_SLEEP`).
-- **RGB status LED** (`-DWIRSA_LED_NEOPIXEL=<gpio>`): blue / red for WiFi on / off, a dark flash for SD traffic, green pulses for Mesh. See `README-Palm.md`, "Status LED".
+- **SASD over a wireless serial link:** the receiver drops a packet that stalls for 100 ms and looks inside the bytes of any dropped packet for a real one (`sasd_rx.h`), SASD goes back to 9600 when a Palm that started over is not heard at the negotiated rate, and the INFO reply carries `SASD_FLAG_PIPE` (0x2000). See `README-Palm.md`, "Over a wireless serial link (NOWttl)".
+- **Status LEDs** (colour LED: three LEDs on the T7-S3, `-DWIRSA_LED_DISCRETE`, red GPIO4, green GPIO7, blue GPIO8, or the WS2812, `-DWIRSA_LED_NEOPIXEL=<gpio>`): green flickers on Palm serial traffic, red on SD traffic, blue on WiFi and BLE traffic of ours (unicast IP: no ARP, broadcast, multicast or mDNS); the BOOT button blinks red. No mode has a state of its own: HotSync, SASD, SLIP, CalDAV, BitWarden and Mesh show as the traffic they cause (SLIP: green and blue). Blue shows connecting (slow blink), connected (steady 30 s) and lost (three blinks), and while the WiFi or BLE is up follows **Wifi Pulse** (WiRSaControl Setup, below Sleep; `wifiPulse`, CFG byte after `sasdTimeoutMin`): Always On / a 100 ms blip every 15s, 30s (default) or 1min / Never. The GPIO17 LED is unchanged. See `README-Palm.md`, "Status LED".
 
 ## Removed
 

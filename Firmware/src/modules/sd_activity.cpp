@@ -11,17 +11,25 @@ esp_timer_handle_t gTimer = nullptr;
 volatile bool gLit = false;       // LED currently showing the flash
 bool gRest = false;               // LED state to return to
 
+#if defined(WIRSA_LED_DISCRETE)
+#define SD_LED(on) ledPlain(on)   // the colour LEDs show the flash through ledActivity()
+#else
+#define SD_LED(on) ledSet(on)
+#endif
+
 void restore(void *) {
-  ledSet(gRest);
+  SD_LED(gRest);
   gLit = false;
 }
 }
 
 void sdActivity() {
   sdUsageActivity();
+#if defined(WIRSA_LED_COLOUR)
+  ledActivity(LED_ACT_SD);   // a colour LED: a red flicker
 #if defined(WIRSA_LED_NEOPIXEL)
-  ledActivity(LED_ACT_SD);   // an RGB LED: a dark flash over its colour
-  return;
+  return;                    // no plain LED beside it
+#endif
 #endif
   if (!gTimer) {
     esp_timer_create_args_t a = {};
@@ -32,7 +40,7 @@ void sdActivity() {
   if (!gLit) {
     gRest = ledIsOn();
     gLit = true;
-    ledSet(!gRest);
+    SD_LED(!gRest);
   } else {
     esp_timer_stop(gTimer);
   }

@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <stdint.h>
 #include "mode_timer.h"
+#include "hello_confirm.h"
 
 namespace RelayMode {
 
@@ -58,7 +59,12 @@ struct Spec {
   bool (*busy)();                         // work under way that is not silence (a node operation, a dialog open on the Palm): never probed
   bool probed;                            // the skeleton's own state: a probe is out
   unsigned long probeAt;                  // ... and when it went
+
+  // The confirmed switch (handleHello): a Palm that offers it (HELLO_OFFER) gets the reply at the idle rate, and the port moves only when its
+  // HELLO_CONFIRM arrives. Off (false) for a mode that does not use it: the HELLO is answered and the port moves at once, as before. Set at entry.
+  bool helloConfirm;
 };
+
 
 // Enters the mode. False when it was cancelled (WiFi not available: the user is back at the main menu).
 bool enter(Spec &m);

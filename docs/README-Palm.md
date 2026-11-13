@@ -100,7 +100,7 @@ to card, etc.) just works, with zero changes needed on either side.
   be the internal **virtual card** instead (see "Virtual card"): with Disk set to Auto, WiRSa serves it when no
   SD card answers.
 - The Palm's `SASD.prc` slot driver installed (from the original SASD project — this is the Palm-side
-  half; WiRSa is standing in for the SASD *hardware*).
+  half; WiRSa is standing in for the SASD *hardware*). Over a wireless serial link use the improved driver (see "Over a wireless serial link" below).
 
 ### Using it
 
@@ -127,6 +127,22 @@ the virtual card), **SD card** (SASD does not start without one: "PLEASE INSERT 
 named `ESP32`; an SD card with no volume label shows as "Card 0". Every write is on flash before it is
 acknowledged, so ending SASD with a reset does not lose files. The Palm cannot see the SD card and the
 virtual card at the same time: one SASD slot, one serial line.
+
+### Over a wireless serial link (NOWttl)
+
+SASD is the least forgiving of the Palm modes on a link that adds delay and noise: the Palm driver gives an ack 210 ms, reads one byte per call, and stops the whole device on a failed read.
+Over NOWttl (two ESP32-C3 units copying the TTL waveform by radio) that failed at once, and the stock driver cannot get a backup through. What WiRSa does for it (all invisible on a direct cable):
+
+- **A packet that stops half way no longer holds the receiver.** The reference reader keeps waiting for the rest of a packet whose length it has read; when the link lost bytes, the Palm's resends were
+  swallowed as that packet's missing bytes (a 46 s stall was measured). Now a packet with no byte for 100 ms is dropped, and the bytes of any dropped packet (CRC error or stall) except the first are looked at
+  again, because a real packet can sit inside them. The code is `include/sasd_rx.h`, tested on the host by `test_host/sasd_rx_test.cpp`.
+- **No return to 9600 inside SASD.** After `CMD_SET_BAUD` the port stays at the negotiated rate until the mode ends. An earlier version went back to 9600 when bytes arrived for a while without forming a
+  packet (to catch a Palm that had restarted). A damaged data frame on a slow link met the same test, the port dropped to 9600 in the middle of a backup, the Palm unmounted the card, and it could not mount it again
+  while the serial port stayed connected - so the rule is gone. The SASD timeout (Config > Exit Timers: no byte from the Palm for that long) is what hands the port back at 9600.
+- **`SASD_FLAG_PIPE` (0x2000) in the INFO reply**: "a request and the data that goes with it may follow each other without waiting for the first ack". WiRSa handles packets in order, so it copes. The improved
+  Palm driver (`hackmaster_y2035/apps/SASD`, see `SASD_driver.md` there) uses this only on a slow link; the stock driver ignores the bit.
+
+The Palm side needs the improved driver for the rest (a longer ack wait that follows the link, reading in bulk, fewer round trips, errors instead of a fatal alert).
 
 ### Known limitation
 
@@ -474,8 +490,8 @@ messages, and talks to the Palm over the serial line (framed and encrypted like 
 - The mode goes back to the main menu by itself by the Exit Timers (a quiet Palm is probed first).
 - **Background checks and sleep:** with *Background* on and the **Sleep** setting (WiRSaControl Setup: Off, 1, 3, 5, 15
   minutes) not Off, WiRSa sleeps when the main menu has had no Palm traffic for that long and wakes by a timer for each check
-  (about 10 s awake, Bluetooth only, 80 MHz, WiFi off; the LED stays off) and by the Palm line (a normal start at full
-  speed, LED on, awake for the whole Sleep time). About 28 mA asleep at 5 V against 178 mA awake. During the ~10 s of a
+  (about 10 s awake, Bluetooth only, 80 MHz, WiFi off; only the blue LED shows the Bluetooth link) and by the Palm line (a normal start at full
+  speed, awake for the whole Sleep time). About 28 mA asleep at 5 V against 178 mA awake. During the ~10 s of a
   check the board does not listen to the Palm: WiRSaCtl's Find and Refresh just need another try.
 - **Where texts wait:** in WiRSa's memory (200), in a 4 KB ring in RTC memory while asleep (lost on a reset), and on the SD
   card in `/Meshtastic/<node number>/` (`mesh.dat`, `mesh.old`, plain text, 1 to 2 MB, one folder per node). The Palm's **SD History** preference decides whether
@@ -847,30 +863,30 @@ also asks for the SLIP and SASD timeouts, or in WiRSaCtl (Setup → Exit Timers.
 ### BOOT button = HotSync
 
 A short press of the ESP32's **BOOT** button (GPIO0) in any menu screen starts HotSync, just like
-the `H` key; a second press while HotSync is still waiting leaves it. The status LED shows the
-result: 3 slow blinks = HotSync started (or left), one long blink = not started (no disk: no SD card, or the Disk setting is SD card and none answers). After
-that the LED goes back to showing WiFi. Don't hold BOOT while WiRSa resets or powers up: that puts
+the `H` key; a second press while HotSync is still waiting leaves it. The red LED shows the
+result: 3 slow blinks = HotSync started (or left), one long blink = not started (no disk: no SD card, or the Disk setting is SD card and none answers). The HotSync traffic then flickers green (serial) and red (SD card). Don't hold BOOT while WiRSa resets or powers up: that puts
 the ESP32 into its firmware-download mode. Turn it off with `WIRSA_FEATURE_BOOT_HOTSYNC 0` in
 `globals.h`.
 
 ### Status LED
 
-One LED shows the WiFi state, SD card traffic and (RGB only) Mesh activity. Two kinds are built; the pin and the levels belong to the board, in `globals.h`.
+The colour LED shows what the radios and the ports are doing, and nothing else: no mode has a state of its own. HotSync, SASD, SLIP, CalDAV, BitWarden and Mesh show only as the traffic they cause. Three kinds of LED are built; the pin and the levels belong to the board, in `globals.h`.
 
-- **Single LED.** `LED_PIN` in `globals.h` (GPIO2 by default, active-low, full brightness). On the LilyGO T7-S3 build (`-DWIRSA_BOARD_T7S3`) it is the on-board LED on GPIO17, active-high, dimmed to `WIRSA_LED_BRIGHTNESS` 5 %, both set in the T7-S3 block of `globals.h`.
-- **RGB LED (WS2812).** Add `-DWIRSA_LED_NEOPIXEL=<gpio>` to the build flags (GPIO 48 on the ESP32-S3 board with the OLED). It replaces the single LED. Colours and level: `WIRSA_LED_RGB` (default blue), `WIRSA_LED_NOWIFI_RGB` (red), `WIRSA_LED_ACT_RGB` (green) and `WIRSA_LED_NEO_PCT` (default 1 %, a WS2812 at full power is very bright); each can be set with a build flag too. The T7-S3 build refuses the flag (`#error`): it has a single LED.
+- **Single LED.** `LED_PIN` in `globals.h` (GPIO2 by default, active-low, full brightness). On the LilyGO T7-S3 build (`-DWIRSA_BOARD_T7S3`) it is the on-board LED on GPIO17, active-high, dimmed to `WIRSA_LED_BRIGHTNESS` 5 %, both set in the T7-S3 block of `globals.h`. It shows the WiFi state and flashes inverted for 30 ms on SD traffic, as it always did, beside the three LEDs below.
+- **Three LEDs (T7-S3).** The `t7s3` environment adds `-DWIRSA_LED_DISCRETE`: D1 red on GPIO4, D2 green on GPIO7, D3 blue on GPIO8, each through a resistor to ground (active-high, `WIRSA_LED_RGB_ON`), at `WIRSA_LED_NEO_PCT` 5 %. In the deep sleep the three pins are driven low and held.
+- **RGB LED (WS2812).** Add `-DWIRSA_LED_NEOPIXEL=<gpio>` to the build flags (GPIO 48 on the ESP32-S3 board with the OLED). It replaces the single LED. Level: `WIRSA_LED_NEO_PCT` (default 1 %, a WS2812 at full power is very bright). The T7-S3 build refuses the flag (`#error`): it has the three LEDs above.
 
-| State | RGB LED | Single LED (T7-S3) |
+| Colour | Steady | Flickers on |
 |---|---|---|
-| WiFi connected | blue | on |
-| WiFi not connected (starting, dropped, no network saved, access point) | red | off |
-| SD card traffic | dark flash, 30 ms | inverse flash, 30 ms |
-| BOOT button (HotSync) | blinks blue / red, then the WiFi colour | blinks on / off, then the WiFi state |
-| Mesh session, idle | dark | follows WiFi like any mode |
-| Mesh mode started | one green blink, 400 ms | none |
-| Mesh frame to or from the node | green flicker, 40 ms | none |
-| Mesh text sent or received, or an acknowledgement | green blink, 150 ms | none |
-| Mesh background check (timer wake) | dark | off |
+| Blue | the WiFi is up (connected, or the access point) or the BLE link is up: steady with **Wifi Pulse** "Always On", otherwise see below | WiFi traffic of ours (unicast IP, not ARP, broadcast, multicast or mDNS) or BLE traffic (a short dark dip) |
+| Green | off | Palm serial port traffic, in either direction |
+| Red | off | SD card traffic |
+
+Every flicker is 30 ms, followed by at least 30 ms without one, so heavy traffic shows as a steady fast flicker. The BOOT button (HotSync) blinks red, 1 s on and 1 s off, three times (once for no SD card). The deep sleep is all dark.
+
+**Wifi Pulse** (WiRSaControl, Setup, below Sleep; `wifiPulse` in `settings.h`, default 30s) sets how blue shows that the WiFi or BLE is up. *Always On*: steady. *15s*, *30s*, *1min*: dark, with a 100 ms blip at that interval. *Never*: dark, no blip. With any setting but Always On, the traffic flicker is a blue flash on the dark LED. Whatever the setting, the changes are shown: while the WiFi connects, blue blinks slowly (1 s period, 30 s at most; if nothing is up by then: the drop blinks); when it comes up (or the BLE link), blue is steady for 30 s; when it is lost, blue blinks three times quickly.
+
+How the traffic is seen: SD accesses call `sdActivity()`; the Palm UART calls are wrapped at link time (`-Wl,--wrap=uart_write_bytes` and `uart_read_bytes` in `platformio.ini`), so no call site is involved; the WiFi station and access point interfaces get a thin wrapper around their lwIP receive and send functions when they come up; BLE traffic is the frames to and from the Mesh node (`mesh_ble.cpp`). A SLIP session is serial traffic and, because each frame also crosses the WiFi, WiFi traffic: it flickers green and blue.
 | Before deep sleep | dark | off |
 
 The LED follows the WiFi events (connect, disconnect), not the display, so it works on a screenless build. When two pulses overlap the stronger one wins: mode started, then text, then frame, then SD. After leaving a Mesh session the LED returns to the WiFi colour.

@@ -41,19 +41,15 @@
 #define WIRSA_LED_BRIGHTNESS 100   // percent; below 100 the LED is PWM-dimmed (led.h)
 #define LED_OFF HIGH
 // An RGB status LED (WS2812) instead of the plain one: -DWIRSA_LED_NEOPIXEL=<gpio> in the board's build flags. A WS2812 is very bright, so it is dimmed;
-// colour and level can be set the same way (-DWIRSA_LED_RGB=0,255,0 -DWIRSA_LED_NEO_PCT=5). The T7-S3 has a plain LED and sets its own, below.
-#if defined(WIRSA_LED_NEOPIXEL)
-#ifndef WIRSA_LED_RGB
-#define WIRSA_LED_RGB 0, 0, 255
-#endif
+// the level can be set the same way (-DWIRSA_LED_NEO_PCT=5). With -DWIRSA_LED_DISCRETE the colours are three separate LEDs on the board's
+// WIRSA_LED_R_PIN / _G_PIN / _B_PIN (the T7-S3 block, below); the colours, levels and states are the same.
+#if defined(WIRSA_LED_NEOPIXEL) || defined(WIRSA_LED_DISCRETE)
 #ifndef WIRSA_LED_NEO_PCT
+#if defined(WIRSA_LED_DISCRETE)
+#define WIRSA_LED_NEO_PCT 5   // LEDs behind resistors are much dimmer than a WS2812
+#else
 #define WIRSA_LED_NEO_PCT 1
 #endif
-#ifndef WIRSA_LED_NOWIFI_RGB
-#define WIRSA_LED_NOWIFI_RGB 255, 0, 0   // WiFi should be up but is not (led.cpp), at the same level
-#endif
-#ifndef WIRSA_LED_ACT_RGB
-#define WIRSA_LED_ACT_RGB 0, 255, 0   // Mesh activity (led.h), at the same level
 #endif
 #endif
 
@@ -71,7 +67,7 @@
 // Screenless: no OLED and no buttons. USB (native CDC) is the debug console, the Palm is on GPIO43/44 (UART2), and UART0 is free for an expansion port.
 #if defined(WIRSA_BOARD_T7S3)
 #if defined(WIRSA_LED_NEOPIXEL)
-#error "The T7-S3 has a plain LED (LED_PIN below): WIRSA_LED_NEOPIXEL is for other boards"
+#error "The T7-S3 has discrete LEDs (WIRSA_LED_DISCRETE): WIRSA_LED_NEOPIXEL is for other boards"
 #endif
 #undef SWITCH_PIN
 #undef LED_PIN
@@ -92,6 +88,11 @@
 #define LED_ON  HIGH
 #define WIRSA_LED_BRIGHTNESS 5     // PWM duty percent; the eye sees a dim LED brighter than its duty
 #define LED_OFF LOW
+// Three status LEDs (led.h), each behind a resistor to ground, so active-high: D1 red, D2 green, D3 blue.
+#define WIRSA_LED_R_PIN 4
+#define WIRSA_LED_G_PIN 7
+#define WIRSA_LED_B_PIN 8
+#define WIRSA_LED_RGB_ON HIGH
 #define BATTERY_PIN 2      // ADC1, battery through a 1/2 divider
 #define BATTERY_DIVIDER 2
 // Gain correction in parts per thousand, from one multimeter comparison on this board (read 4.25 V, meter 4.202 V); re-measure per board.
@@ -116,7 +117,7 @@
 #define EXP_RX_PIN 16
 #define EXP_CS2_PIN 5
 // Spare GPIOs on the expansion board. 45/46 are strapping pins (nothing may pull them at reset). 47/48 are 1.8 V on octal-PSRAM modules: check the expansion board before connecting 3.3 V devices.
-#define EXP_GPIO_LIST 4, 7, 8, 18, 38, 45, 46, 47, 48
+#define EXP_GPIO_LIST 18, 38, 45, 46, 47, 48   // 4, 7 and 8 drive the status LEDs (WIRSA_LED_R_PIN, _G_PIN, _B_PIN)
 
 // I2C (Qwiic)
 #define I2C_SDA_PIN 13
@@ -132,12 +133,19 @@
 #if WIRSA_PIN_RESERVED(LED_PIN) || WIRSA_PIN_RESERVED(SD_CS) || WIRSA_PIN_RESERVED(SPI_MOSI) \
  || WIRSA_PIN_RESERVED(SPI_MISO) || WIRSA_PIN_RESERVED(SPI_SCK) || WIRSA_PIN_RESERVED(RXD2) \
  || WIRSA_PIN_RESERVED(TXD2) || WIRSA_PIN_RESERVED(EXP_TX_PIN) || WIRSA_PIN_RESERVED(EXP_RX_PIN) \
- || WIRSA_PIN_RESERVED(EXP_CS2_PIN) || WIRSA_PIN_RESERVED(I2C_SDA_PIN) || WIRSA_PIN_RESERVED(I2C_SCL_PIN)
+ || WIRSA_PIN_RESERVED(EXP_CS2_PIN) || WIRSA_PIN_RESERVED(I2C_SDA_PIN) || WIRSA_PIN_RESERVED(I2C_SCL_PIN) \
+ || WIRSA_PIN_RESERVED(WIRSA_LED_R_PIN) || WIRSA_PIN_RESERVED(WIRSA_LED_G_PIN) || WIRSA_PIN_RESERVED(WIRSA_LED_B_PIN)
 #error "T7-S3 pin block uses a reserved pin (USB 19/20, flash 26-32, PSRAM 33-37)"
 #endif
 #define WIRSA_DEEP_SLEEP 1
 #define WIRSA_WAKE_PIN 3   // wired to GPIO44, the Palm RX
 #endif  // WIRSA_BOARD_T7S3
+#if defined(WIRSA_LED_DISCRETE) && defined(WIRSA_LED_NEOPIXEL)
+#error "WIRSA_LED_DISCRETE and WIRSA_LED_NEOPIXEL are two different colour LEDs: use one"
+#endif
+#if defined(WIRSA_LED_DISCRETE) && !defined(WIRSA_LED_R_PIN)
+#error "WIRSA_LED_DISCRETE needs the board's WIRSA_LED_R_PIN, _G_PIN, _B_PIN and WIRSA_LED_RGB_ON"
+#endif
 
 // Deep sleep (deep_sleep.h) is built for the T7-S3, which sets WIRSA_DEEP_SLEEP above, or on any other board with -DWIRSA_DEEP_SLEEP.
 // The Palm line wakes it: with no wake pin set it is the Palm RX itself, which must be an RTC pin (GPIO 0-21).
@@ -308,7 +316,10 @@
 // SASD timeout, minutes (3/5/10/15): SASD returns to the main menu after this long with nothing from the Palm. Past the end too; 0 (a freshly grown byte) or anything else reads as the default.
 #define SASD_TIMEOUT_ADDRESS       447
 
-#define LAST_ADDRESS    447
+// WiFi pulse (settings.h): the blue LED's idle behaviour, stored as mode + 1 so a freshly grown byte (0) reads as the default.
+#define WIFI_PULSE_ADDRESS         448
+
+#define LAST_ADDRESS    448
 
 // Version. VERSIONB was bumped 1 -> 2 to force the one-time defaultEEPROM() after the layout change (the later server-port/telnet removal needed no bump of its own: an older, larger layout
 // gets the same reset). Bumped 2 -> 3 for the pinPolarity removal, which shifts every later address by one byte and so needs its own reset.

@@ -81,7 +81,10 @@ static RelayMode::Spec bwMode = {
   BW_HELLO_ACK, BW_PROTOCOL_VERSION, "WiRSa-BW/2",
 };
 
-void enterBitwardenRelayMode() { RelayMode::enter(bwMode); }
+void enterBitwardenRelayMode() {
+  bwMode.helloConfirm = true;   // the confirmed switch (relay_mode.h): the port moves only when the Palm has read the HELLO reply
+  RelayMode::enter(bwMode);
+}
 void exitBitwardenRelayMode() { RelayMode::leave(bwMode); }
 
 // The frames the Palm sends and what answers each (RelayMode::dispatch warns about a type not in the table).

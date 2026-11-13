@@ -16,6 +16,7 @@
 #include <SD.h>
 #include "sd_activity.h"
 #include "sd_usage.h"
+#include "sasd_rx.h"
 #include "vdisk.h"
 #include "settings.h"      // sasdDiskMode
 
@@ -33,6 +34,10 @@
 #define SASD_CMD_RESET_STATE   0x04
 #define SASD_CMD_SET_BAUD      0x05
 // CMD_FW_UPDATE_START and CMD_GET_BATT are not implemented: only SlotCustomControl reaches them, not the VFS read/write path this mode exists for.
+
+// INFO flags the reader adds to the reference's: a Palm driver that sees SASD_FLAG_PIPE may send a request and the data that goes with it (WRITE then XFER, READ then CTS) back to back, without waiting
+// for the first ack. Packets are handled in order, so a reader that handles one packet at a time already copes; the 4 KB receive buffer holds the second while the first is answered.
+#define SASD_FLAG_PIPE         0x00002000UL
 
 #define SASD_RSP_PONG          0x40
 #define SASD_RSP_OK            0x41
@@ -74,26 +79,13 @@
 
 // ---- State ----
 
-enum SasdRxState { SASD_RX_SYNC, SASD_RX_PAYLOAD, SASD_RX_CRC };
-
-struct SasdRxCtx {
-  SasdRxState state;
-  uint8_t     window[SLK_HDR_LEN];
-  uint8_t     dstSlk, srcSck, pktTyp, tid;
-  uint16_t    dataLen;
-  uint8_t     payload[SASD_MAX_PAYLOAD];
-  uint16_t    payloadPos;
-  uint8_t     crcBuf[2];
-  uint8_t     crcPos;
-};
-
 enum SasdOp { SASD_OP_NONE, SASD_OP_READ, SASD_OP_WRITE };
 struct SasdOpState {
   SasdOp   op;
   uint32_t firstSec, numSec, doneSec;
 };
 
-static SasdRxCtx    sasdRx;
+static SasdRx::Ctx  sasdRx;                  // the receive state machine (sasd_rx.h)
 static SasdOpState  sasdOp = { SASD_OP_NONE, 0, 0, 0 };
 static uint8_t      sasdPrevTid = 0;
 static bool         sasdHavePrevTid = false;
@@ -121,6 +113,9 @@ static unsigned long sasdLastFileOpMillis = 0;
 static bool          sasdCapacityStale = false;
 static uint32_t     sasdBytesIn = 0, sasdBytesOut = 0;
 static uint32_t     sasdCrcErrors = 0, sasdProtoErrors = 0;
+// Back to 9600: after CMD_SET_BAUD the port stays at the negotiated rate, so a Palm that starts over (reset, wake after a failed session) and tries 9600 was not heard again until SASD was restarted.
+static uint32_t     sasdCurBaud = SASD_BAUD_INITIAL, sasdBytesSinceValid = 0;
+static unsigned long sasdValidMs = 0;
 static uint32_t     sasdSpeedLastBytes = 0;
 static unsigned long sasdSpeedLastMillis = 0;
 static float        sasdSpeedKBs = 0.0f;
@@ -151,8 +146,7 @@ static void sasdScanCapacity();
 // ---- slk framing layer ----
 
 static void sasdRxReset() {
-  sasdRx.state = SASD_RX_SYNC;
-  memset(sasdRx.window, 0, sizeof(sasdRx.window));
+  SasdRx::flush(sasdRx);
 }
 
 static uint8_t sasdSum9(const uint8_t *hdr9) {
@@ -205,67 +199,26 @@ static void sasdSendError(uint8_t tid, uint8_t flags, uint16_t ofst, uint8_t err
   sasdSendAck(tid, flags, ofst, ed, sizeof(ed));
 }
 
-// ---- Byte-at-a-time receive state machine (as slip.cpp's slipReceiveByte()), fed one byte per call from sasdLoop() so nothing blocks loop(). Returns true when a full slk
-// packet has been received and CRC-verified into sasdRx. ----
+// ---- Byte-at-a-time receive (sasd_rx.h), fed one byte per call from sasdLoop() so nothing blocks loop(). Returns true when a full slk packet has been received and CRC-verified into sasdRx.
+// A CRC mismatch drops the packet, as the reference's slkRx() does; the Palm retries (up to FRAG_MAX_RESENDS), and the dropped packet's bytes are looked at again for a real packet inside. ----
 
 static bool sasdReceiveByte(uint8_t byte) {
-  switch (sasdRx.state) {
-    case SASD_RX_SYNC: {
-      for (int i = 0; i < SLK_HDR_LEN - 1; i++) sasdRx.window[i] = sasdRx.window[i + 1];
-      sasdRx.window[SLK_HDR_LEN - 1] = byte;
-
-      if (sasdRx.window[0] == SLK_MAGIC0 && sasdRx.window[1] == SLK_MAGIC1 &&
-          sasdRx.window[2] == SLK_MAGIC2 && sasdRx.window[9] == sasdSum9(sasdRx.window)) {
-        sasdRx.dstSlk = sasdRx.window[3];
-        sasdRx.srcSck = sasdRx.window[4];
-        sasdRx.pktTyp = sasdRx.window[5];
-        sasdRx.dataLen = ((uint16_t)sasdRx.window[6] << 8) | sasdRx.window[7];
-        sasdRx.tid = sasdRx.window[8];
-
-        if (sasdRx.dataLen > SASD_MAX_PAYLOAD) {
-          // Cannot be a real SASD message (or the link is corrupt): keep scanning, avoid an overrun.
-          break;
-        }
-        sasdRx.payloadPos = 0;
-        sasdRx.crcPos = 0;
-        sasdRx.state = sasdRx.dataLen ? SASD_RX_PAYLOAD : SASD_RX_CRC;
-      }
-      break;
+  SasdRx::Result r = SasdRx::feed(sasdRx, byte);
+  if (r == SasdRx::CRC_ERROR) {
+    sasdCrcErrors++;
+    if (logOn(LOG_WARN)) {
+      logPrintf(LOG_WARN, "SASD: *** CRC error #%lu (got %04X, expected %04X, %u-byte packet) - dropped, Palm will retry ***\r\n",
+                     (unsigned long) sasdCrcErrors, sasdRx.crcRxed, sasdRx.crcCalc, (unsigned) sasdRx.dataLen);
     }
-
-    case SASD_RX_PAYLOAD:
-      sasdRx.payload[sasdRx.payloadPos++] = byte;
-      if (sasdRx.payloadPos >= sasdRx.dataLen) sasdRx.state = SASD_RX_CRC;
-      break;
-
-    case SASD_RX_CRC:
-      sasdRx.crcBuf[sasdRx.crcPos++] = byte;
-      if (sasdRx.crcPos >= 2) {
-        uint16_t crcRxed = ((uint16_t)sasdRx.crcBuf[0] << 8) | sasdRx.crcBuf[1];
-        uint16_t crcCalc = 0;
-        for (int i = 0; i < SLK_HDR_LEN; i++) crcCalc = zmCRC16Update(crcCalc, sasdRx.window[i]);
-        for (uint16_t i = 0; i < sasdRx.dataLen; i++) crcCalc = zmCRC16Update(crcCalc, sasdRx.payload[i]);
-
-        // Ready for the next packet either way: a CRC mismatch drops this one and resyncs, as the reference's slkRx() does. The Palm retries (up to FRAG_MAX_RESENDS over ~600 ms),
-        // so an occasional drop recovers; frequent ones mean the link runs faster than it can sustain.
-        sasdRxReset();
-
-        if (crcRxed == crcCalc) return true;
-
-        sasdCrcErrors++;
-        if (logOn(LOG_WARN)) {
-          logPrintf(LOG_WARN, "SASD: *** CRC error #%lu (got %04X, expected %04X, %u-byte packet) - dropped, Palm will retry ***\r\n",
-                         (unsigned long) sasdCrcErrors, crcRxed, crcCalc, (unsigned) sasdRx.dataLen);
-        }
-      }
-      break;
   }
-  return false;
+  return r == SasdRx::PACKET;
 }
 
 // ---- Dispatch, as lpc81x.c's parseAndReplyToSasdPacket() ----
 
 static void sasdProcessPacket() {
+  sasdValidMs = millis();
+  sasdBytesSinceValid = 0;
   if (sasdRx.dstSlk != SASD_PKT_ADDR || sasdRx.srcSck != SASD_PKT_ADDR ||
       sasdRx.pktTyp != SASD_PKT_TYP) {
     return;  // not a SASD packet - ignore (e.g. link noise)
@@ -317,6 +270,7 @@ static void sasdDispatchCommand(uint8_t tid, uint8_t flags, uint16_t ofst,
         info[4] = (uint8_t)(numBlocks >> 24); info[5] = (uint8_t)(numBlocks >> 16);
         info[6] = (uint8_t)(numBlocks >> 8);  info[7] = (uint8_t)(numBlocks);
       }
+      flagsVal |= SASD_FLAG_PIPE;
       info[8] = (uint8_t)(flagsVal >> 24); info[9] = (uint8_t)(flagsVal >> 16);
       info[10] = (uint8_t)(flagsVal >> 8); info[11] = (uint8_t)(flagsVal);
       // manuf, oem and snum (offsets 1-3 and 12-15) stay 0: SD.h does not expose them.
@@ -483,6 +437,7 @@ static void sasdDispatchCommand(uint8_t tid, uint8_t flags, uint16_t ofst,
       PhysicalSerial.end();
       delay(200);
       PhysicalSerial.begin(rate, SERIAL_8N1, RXD2, TXD2);
+      sasdCurBaud = rate;
       sasdRxReset();
       break;
     }
@@ -702,6 +657,9 @@ void enterSasdMode() {
   PhysicalSerial.end();
   delay(200);
   PhysicalSerial.begin(SASD_BAUD_INITIAL, SERIAL_8N1, RXD2, TXD2);
+  sasdCurBaud = SASD_BAUD_INITIAL;
+  sasdValidMs = millis();
+  sasdBytesSinceValid = 0;
 
   SerialPrintLn("SASD Active - waiting for the Palm to connect");
   SerialPrintLn("Press +++ or BACK button to exit");
@@ -777,15 +735,28 @@ void sasdLoop() {
   }
 
   // Feed every available byte to the receive state machine; each validated packet is dispatched and acked at once (the passive "device" role).
-  while (PhysicalSerial.available()) {
-    uint8_t b = (uint8_t) PhysicalSerial.read();
+  for (;;) {
+    uint8_t b;
+    if (SasdRx::pushed(sasdRx, b)) {            // bytes of a dropped packet, looked at again for a real one inside
+      if (sasdReceiveByte(b)) sasdProcessPacket();
+      continue;
+    }
+    if (!PhysicalSerial.available()) break;
+    b = (uint8_t) PhysicalSerial.read();
     unsigned long now = millis(), gap = now - sasdLastRxMs;
     if (gap > sasdLongestQuietMs) sasdLongestQuietMs = gap;
     if (gap > 5000) LOGI("SASD: Palm traffic again after %lu s quiet (first byte 0x%02X, %lu byte(s) seen so far)\r\n",
                          gap / 1000UL, (unsigned) b, (unsigned long) sasdRxByteCount);
     sasdLastRxMs = now;
     sasdRxByteCount++;
+    sasdBytesSinceValid++;
     if (sasdReceiveByte(b)) sasdProcessPacket();
+  }
+  // A packet whose rest never came (the link lost bytes) used to hold the receiver for as long as the Palm's resends took to fill it: they were swallowed (measured: 46 s). Drop it and look in its bytes for a real packet.
+  if (SasdRx::stalled(sasdRx, millis() - sasdLastRxMs)) {
+    LOGV("SASD: a %u byte packet stopped after %u byte(s) - dropped, its bytes looked at again\r\n", (unsigned) sasdRx.dataLen, (unsigned) sasdRx.payloadPos);
+    SasdRx::replay(sasdRx);
+    return;
   }
   // SASD timeout (Config > Exit Timers): nothing from the Palm for that long. The Palm is off or its driver let go of the port (measured: silent, no polling, no noise), so go back to
   // the main menu, where WiRSaCtl works again. No check for an operation under way: every operation is driven by the Palm's packets, and sasdOp stays set after a read or write until RESET_STATE.

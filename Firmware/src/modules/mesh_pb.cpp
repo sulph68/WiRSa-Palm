@@ -486,7 +486,7 @@ size_t adminFlag(uint8_t *out, size_t cap, uint32_t field, const uint8_t *key, s
   Wr w(out, cap); w.u(field, 1); putKey(w, key, keyLen); return w.ok ? w.n : 0;
 }
 size_t adminInt(uint8_t *out, size_t cap, uint32_t field, uint32_t v, const uint8_t *key, size_t keyLen) {
-  // unsigned: a node number with the top bit set (e2e53670) stays 5 bytes instead of sign-extending to 10
+  // unsigned: a node number with the top bit set (e1a2b3c4) stays 5 bytes instead of sign-extending to 10
   Wr w(out, cap); w.tag(field, 0); w.varint(v); putKey(w, key, keyLen); return w.ok ? w.n : 0;
 }
 size_t adminTime(uint8_t *out, size_t cap, uint32_t utc, const uint8_t *key, size_t keyLen) {

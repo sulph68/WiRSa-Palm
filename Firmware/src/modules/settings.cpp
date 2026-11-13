@@ -17,6 +17,11 @@ extern bool usbDebug;
 
 uint8_t modeUnusedExitSec = MODE_UNUSED_EXIT_DEFAULT;
 uint8_t deepSleepMin = 0;
+uint8_t wifiPulse = WIFI_PULSE_DEFAULT;
+
+bool wifiPulseValid(uint8_t m) {
+  return m <= WIFI_PULSE_NEVER;
+}
 
 bool deepSleepValid(uint8_t m) {
   return m == 0 || m == 1 || m == 3 || m == 5 || m == 15;
@@ -56,6 +61,7 @@ void writeSettings() {
   EEPROM.write(EXIT_TIMERS_MARK_ADDRESS, EXIT_TIMERS_MARK);
   EEPROM.write(MODE_UNUSED_EXIT_ADDRESS, modeUnusedExitSec);
   EEPROM.write(DEEP_SLEEP_ADDRESS, deepSleepMin);
+  EEPROM.write(WIFI_PULSE_ADDRESS, wifiPulse + 1);
   EEPROM.write(MODE_AFTER_EXIT_ADDRESS, modeAfterExitSec);
   EEPROM.write(SLIP_TIMEOUT_ADDRESS, slipTimeoutMin);
   EEPROM.write(SASD_TIMEOUT_ADDRESS, sasdTimeoutMin);
@@ -107,6 +113,7 @@ void readSettings() {
   if (!sasdTimeoutValid(sasdTimeoutMin)) sasdTimeoutMin = SASD_TIMEOUT_DEFAULT;
   deepSleepMin = EEPROM.read(DEEP_SLEEP_ADDRESS);
   if (!deepSleepValid(deepSleepMin)) deepSleepMin = 0;
+  { uint8_t v = EEPROM.read(WIFI_PULSE_ADDRESS); wifiPulse = (v >= 1 && wifiPulseValid(v - 1)) ? v - 1 : WIFI_PULSE_DEFAULT; }
   sasdDiskMode = EEPROM.read(SASD_DISK_ADDRESS);
   if (sasdDiskMode > SASD_DISK_VIRTUAL) sasdDiskMode = SASD_DISK_AUTO;
 }

@@ -76,8 +76,8 @@ void sleepNow() {
   if (meshBgActive()) timerUs = meshBeforeSleep();   // texts to the SD card (or the ring), and the next check's timer
 #endif
   if (!vdfsMounted()) vdiskClose();
-#if defined(WIRSA_LED_NEOPIXEL)
-  ledDark();   // an RGB LED would keep its red in the sleep
+#if defined(WIRSA_LED_COLOUR)
+  ledDark();   // a colour LED would keep its red in the sleep
 #else
   ledSet(false);
 #endif

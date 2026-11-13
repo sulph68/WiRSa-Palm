@@ -39,9 +39,11 @@ void blinkTick() {
   gBlinkSteps--;
   gBlinkNextAt = millis() + gBlinkStepMs;
   if (gBlinkSteps > 0)
-    ledSet(gBlinkSteps & 1);   // odd = on
-  else
+    { ledSet(gBlinkSteps & 1); ledHotSync(gBlinkSteps & 1); }   // odd = on: the plain LED and the red LED
+  else {
     ledSet(WiFi.status() == WL_CONNECTED);
+    ledHotSync(false);
+  }
 }
 
 // true once per short press, on release

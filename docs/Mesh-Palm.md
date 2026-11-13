@@ -182,8 +182,8 @@ bit); with background checks on, a timer is armed too.
   card; the WiFi is switched off; the timer is set to the time until the next check (at least 5 s).
 - **Timer wake:** `meshHeadlessWake()` runs first in `setup()` and does not return. CPU 80 MHz (the radio needs 80 MHz;
   nothing here needs more), no WiFi, no display, no menu: it runs one background check, puts the texts found into the ring and
-  sleeps again for the interval. About 10 s awake and 28 mA asleep. The LED stays off, which is how a timer wake differs
-  from a full wake. In a live session an RGB status LED shows Mesh activity in green (see `README-Palm.md`, "Status LED"); the background checks never light it. The first and last lines of its log may be lost: the USB port needs about 2 s to come back after a wake.
+  sleeps again for the interval. About 10 s awake and 28 mA asleep. The green and red LEDs stay off; blue shows the
+  Bluetooth link coming up (see `README-Palm.md`, "Status LED"). A Mesh session lights no state of its own: its Palm serial traffic flickers green and its BLE traffic blue. The first and last lines of its log may be lost: the USB port needs about 2 s to come back after a wake.
 - **Palm line wake:** a normal boot at full speed with everything on: the ring and the SD files are restored into the
   store, what the card does not hold is written to it, a background check runs at once, and the board stays awake for the
   whole Sleep time. A wake by line noise does the same (it sleeps again after the Sleep time).

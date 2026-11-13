@@ -58,7 +58,10 @@ static RelayMode::Spec cddvMode = {
   CDDV_HELLO_ACK, /*helloVersion*/ CDDV_PROTOCOL_VERSION, "WiRSa-DAV/2",
 };
 
-void enterCalDavRelayMode() { RelayMode::enter(cddvMode); }
+void enterCalDavRelayMode() {
+  cddvMode.helloConfirm = true;   // the confirmed switch (relay_mode.h): the port moves only when the Palm has read the HELLO reply
+  RelayMode::enter(cddvMode);
+}
 void exitCalDavRelayMode() { RelayMode::leave(cddvMode); }
 
 // The frames the Palm sends and what answers each (RelayMode::dispatch warns about a type not in the table).

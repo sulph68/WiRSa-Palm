@@ -44,7 +44,6 @@ static void meshOnEnter() {
   gBusyOp = 0; gScan.done = gPairRes.done = gConnRes.done = gCfgWriteRes.done = gCfgReadRes.done = false; gPinNeed = false; gSendHead = gSendTail = 0; gLinkPending = false; gWasUp = false;
   gWorkerOn = true;
   gStarted = true;
-  ledActivity(LED_ACT_MODE);                      // an RGB LED: one green blink, the mode is up (it is dark in a session)
 }
 
 static void meshBeforeLeave() {
@@ -94,7 +93,10 @@ static RelayMode::Spec meshMode = {
 
 RelayMode::Spec &meshSpec() { return meshMode; }
 
-void enterMeshRelayMode() { RelayMode::enter(meshMode); }
+void enterMeshRelayMode() {
+  meshMode.helloConfirm = true;   // the confirmed switch (relay_mode.h): the port moves only when the Palm has read the HELLO reply
+  RelayMode::enter(meshMode);
+}
 void exitMeshRelayMode() { RelayMode::leave(meshMode); }
 
 void meshRelayLoop() {

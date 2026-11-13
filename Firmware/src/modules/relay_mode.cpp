@@ -168,6 +168,18 @@ bool readFrame(Spec &m, uint8_t &type, uint8_t *body, size_t cap, size_t &len, u
   return true;
 }
 
+// The port moves to the agreed rate: from here the Palm's next frame is expected at it.
+static void switchToNegotiated(Spec &m, uint32_t neg) {
+  PhysicalSerial.begin(neg, WIRSA_SERIAL_FORMAT, RXD2, TXD2);
+  if (m.negotiatedAt) *m.negotiatedAt = millis();
+  if (m.sessionActive) *m.sessionActive = true;
+  if (m.timer) modeTimerSessionActive(*m.timer);
+  m.drawHeader();                   // the live baud readout in the title bar
+}
+
+// The confirmed switch (hello_confirm.h): the offer that is waiting for its confirm.
+static HelloPending gHelloPending;
+
 bool handleHello(Spec &m, const uint8_t *body, size_t len) {
   RelayProto::Reader r(body, len);
   uint32_t offered = r.u32();
@@ -176,23 +188,33 @@ bool handleHello(Spec &m, const uint8_t *body, size_t len) {
     return false;
   }
   uint32_t neg = agreedBaud(offered, m.idleBaud);
-  LOGI("%s: baud negotiate - Palm offered %lu, capped to %lu (WiRSa config max)", m.tag, (unsigned long) offered, (unsigned long) neg);
+  HelloAct act = helloDecide(m.helloConfirm && m.helloServer, body, len, neg, millis(), gHelloPending);
+
+  if (act == HelloAct::Ignore) {
+    LOGW("%s: HELLO confirm without an open offer - ignored", m.tag);
+    return false;
+  }
+  if (act == HelloAct::Switch) {
+    LOGI("%s: baud confirmed by the Palm - switching to %lu", m.tag, (unsigned long) neg);
+    switchToNegotiated(m, neg);
+    return true;
+  }
+
+  LOGI("%s: baud negotiate - Palm offered %lu, capped to %lu (WiRSa config max)%s", m.tag, (unsigned long) offered, (unsigned long) neg,
+       act == HelloAct::ReplyAndWait ? ", waiting for its confirm" : "");
 
   uint8_t buf[64];
   RelayProto::Writer w(buf, sizeof buf);
   if (m.helloServer) {
     w.u8(m.helloVersion);
-    w.u8(0x00);                     // capability flags: none
+    w.u8(act == HelloAct::ReplyAndWait ? CAP_HELLO_CONFIRM : 0x00);   // capability flags
     w.str(String(m.helloServer));
   }
   w.u32(neg);
   // writeFrame flushes before it returns: the reply is fully on the wire, at the OLD rate the Palm still listens at, before the port moves.
   RelayProto::writeFrame(PhysicalSerial, m.helloAckType, buf, w.len);
-  PhysicalSerial.begin(neg, WIRSA_SERIAL_FORMAT, RXD2, TXD2);
-  if (m.negotiatedAt) *m.negotiatedAt = millis();
-  if (m.sessionActive) *m.sessionActive = true;
-  if (m.timer) modeTimerSessionActive(*m.timer);
-  m.drawHeader();                   // the live baud readout in the title bar
+  // With an offer open the port stays where it is until the Palm confirms it has read the reply.
+  if (act == HelloAct::ReplyAndSwitch) switchToNegotiated(m, neg);
   return true;
 }
 

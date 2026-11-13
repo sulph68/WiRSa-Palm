@@ -41,4 +41,10 @@ extern uint8_t sasdDiskMode;
 extern uint8_t deepSleepMin;
 bool deepSleepValid(uint8_t minutes);
 
+// WiFi pulse (led.h): how the blue LED shows that the WiFi or BLE is up. 0 always on, 1 a blip every 15 s, 2 every 30 s, 3 every minute, 4 never (no blip).
+// Boot, a connect and a drop are shown whatever the setting (led.h).
+enum { WIFI_PULSE_ALWAYS = 0, WIFI_PULSE_15S = 1, WIFI_PULSE_30S = 2, WIFI_PULSE_1MIN = 3, WIFI_PULSE_NEVER = 4, WIFI_PULSE_DEFAULT = WIFI_PULSE_30S };
+extern uint8_t wifiPulse;
+bool wifiPulseValid(uint8_t mode);
+
 #endif // SETTINGS_H

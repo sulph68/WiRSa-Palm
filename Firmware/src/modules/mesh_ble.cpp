@@ -105,6 +105,7 @@ bool begin() {
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);  // the PIN comes from us
   NimBLEDevice::setMTU(247);
   gInit = true;
+  ledBle(true);
   return true;
 }
 
@@ -113,6 +114,7 @@ void shutdown() {
   disconnect();
   NimBLEDevice::deinit(true);
   gInit = false;
+  ledBle(false);
   if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(false);    // back to the network modes' setting (network.cpp)
   LOGI("Mesh BLE: stopped");
 }
@@ -231,7 +233,7 @@ bool connect(const uint8_t addr[6], uint8_t type, uint32_t pin) {
 bool write(const uint8_t *buf, size_t len) {
   if (!connected()) return false;
   bool ok = gTo->writeValue(buf, len, true);
-  if (ok && menuMode == MODE_MESH) ledActivity(LED_ACT_FRAME);   // a live session only: the background checks stay dark
+  if (ok) ledActivity(LED_ACT_NET);
   return ok;
 }
 
@@ -242,7 +244,7 @@ bool read(uint8_t *buf, size_t cap, size_t &len) {
   if (v.size() > cap) return false;
   memcpy(buf, v.data(), v.size());
   len = v.size();
-  if (len && menuMode == MODE_MESH) ledActivity(LED_ACT_FRAME);
+  if (len) ledActivity(LED_ACT_NET);
   return true;
 }
 
