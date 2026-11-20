@@ -431,6 +431,7 @@ Names: the firmware calls the four longer ones `CTL_SECRETS`, `CTL_ENTER`, `CTL_
 | `0x4C` | SPEED | `baud u32` | `ok u8, baud u32` | Sets the rate the menu uses: the fastest of 9600, 14400, 19200, 28800, 38400, 57600, 115200 not above the request. The reply goes out at the old rate |
 | `0x4D` | LOG | `op u8 (0 read, 1 clear), offset u32` | `total u32, offset u32, n u16, n bytes` | A page (480 bytes at most) of WiRSa's session log, oldest first. Main menu only |
 | `0x4E` | SYSINFO | `op u8 (unused), offset u32` | `total u32, offset u32, n u16, n bytes` | WiRSa's system page as text, same page shape as LOG. Main menu only |
+| `0x4F` | FORMAT_SD | `"FORMAT"` (6 bytes), `copy u8` | `ok u8, fat u8, copied u8, total u8, note str` | Erases the SD card: one partition, FAT16 up to 2 GB, FAT32 above (`fat` 16 or 32). With `copy` 1 it then copies every file in the virtual card's `/PALM/PROGRAMS/SASD` to the same folder on the card, reading each back: `copied` of `total` (0 = the virtual card has no such folder); `note` is "" or why the copy failed. ERR 5 while the FTP server runs, 2 no SD card, 7 format failed. Blocks until done: the Palm waits up to 240 s |
 | `0x5F` | ERR | - | `code u8, text str` | A request could not be done |
 
 Notes (`palm_ctl.cpp`):

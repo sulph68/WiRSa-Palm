@@ -12,6 +12,7 @@
 String sdHumanBytes(uint64_t bytes, int decimals);   // "1.234GB", "14.8GB" - SASD's own shortening
 
 void sdUsageActivity();        // SD traffic happened (sd_activity): used space may have changed
+void sdUsageReset();           // the card was replaced or formatted: forget the old count and start again now
 void sdUsageStep();            // call every loop pass while in the menus; does a little work at most
 String sdUsageText();          // "1.234GB/14.8GB", "?/14.8GB" while counting, "" if unknown
 

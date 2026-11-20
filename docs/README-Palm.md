@@ -741,7 +741,8 @@ below).
   HotSync), and four buttons: **FTP Setup...** (user, password), **AP Setup...** (access-point name,
   password), **SLIP Address...** and **Exit Timers...**. A blank password field means "keep the
   current one".
-- **Options menu:** Find WiRSa, Reboot WiRSa, Factory Reset (asks first), Preferences (this Palm's
+- **Options menu:** Find WiRSa, Reboot WiRSa, Factory Reset (asks first), Format SD Card (asks first;
+  a box copies the virtual card's SASD install set onto the new card), Preferences (this Palm's
   "Pref Baud").
 - **Help menu:** **System** (chip, memory, flash and partitions), **Show Logs** (WiRSa's session log)
   and About. See "Logs and the System page".
@@ -780,6 +781,10 @@ Palms differ in how fast their serial port can go (one might manage 115200, an o
 - **Config → Baud Rate (Max)** (WiRSaCtl: Setup → "Max baud") is the fastest rate HotSync, SASD,
   CalDAV Relay and BitWarden Relay may agree on. Each sync still starts at 9600 and settles on the
   lower of the Palm app's own rate and this maximum. Changing it doesn't move the menu.
+- **Utilities → Format SD Card** erases the SD card, then copies the virtual card's `/PALM/PROGRAMS/SASD` onto it.
+  Not while the FTP server runs. The virtual card is never formatted on request (a blank Palm is set up from its files).
+  `sd_format.cpp`; the Palm's FORMAT_SD frame is in `docs/protocol/Protocol-wire.md` section 12.
+- **Utilities → Information** ends with `Disk:`, `SD:` and `V. SD:` lines (the Disk setting and each card's used/total).
 - **Utilities → Information** shows "Baud: 115200 now 57600" when the menu runs at a different
   rate from the maximum.
 - **What only works after WiRSaCtl has run:** anything that talks to the menu at a fixed rate

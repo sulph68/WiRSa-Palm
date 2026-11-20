@@ -472,7 +472,7 @@ void baudLoop()
     menuBaudReset();   // the menu's session rate, within the new maximum (palm_ctl.h)
     PhysicalSerial.end();
     delay(200);
-    PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT);
+    PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT, RXD2, TXD2);   // the pins: without them UART2 takes its defaults, GPIO 19/20 on the S3 = the USB lines
     settingsMenu(false);
   } else if (serAvl>0) {
     // between A and E, or a and e
@@ -485,7 +485,7 @@ void baudLoop()
       menuBaudReset();
       PhysicalSerial.end();
       delay(200);
-      PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT);
+      PhysicalSerial.begin(menuBaud(), WIRSA_SERIAL_FORMAT, RXD2, TXD2);   // the pins: without them UART2 takes its defaults, GPIO 19/20 on the S3 = the USB lines
       settingsMenu(false);
     } else
       baudMenu(false);

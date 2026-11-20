@@ -43,10 +43,12 @@ static bool hsVirtual = false;
 #define FRAG_FLAG_LAST    0x40
 #define FRAG_FLAG_OOM     0x20
 #define FRAG_MAX_CHUNK_SZ 524
-// Resend budget: the SASD reference used ~150 ms x 4, which failed the first real HotSync ("handshake failed" and nothing else). pilot-link's PADP uses 2000 ms x 10 per packet;
-// this is in that range, because an impatient sender looks the same as a protocol failure in the log.
-#define FRAG_MAX_RESENDS  8
-#define FRAG_ACK_WAIT_MS  1000
+// Resend budget and reply wait, as pilot-link's PADP (libpisock/padp.c): PI_PADP_TX_TIMEOUT 2 s x PI_PADP_TX_RETRIES 10 per fragment, and PI_PADP_RX_BLOCK_TO 30 s for the
+// Palm's reply. A Palm deleting or creating a big database, or compacting its heap, takes seconds before it answers; the old 3 s wait gave up on it, went on to the next
+// request and never acked the late reply, and the Palm dropped the connection.
+#define FRAG_MAX_RESENDS  10
+#define FRAG_ACK_WAIT_MS  2000
+#define HS_REPLY_WAIT_MS  30000
 
 // Largest slk payload held at once: FragHdr 4 + one 524-byte data chunk (streaming sends are never buffered whole, see hsFragSendContinue). Request/response envelopes
 // are far smaller (HS_RXBUF_SIZE).
@@ -126,6 +128,19 @@ static unsigned long hsDoneAtMs = 0;
 
 static uint8_t  hsTxTid = 0;
 static uint8_t  hsRxBuf[HS_RXBUF_SIZE];
+
+// The Palm stopped answering (a fragment was never acked, or a reply never came): every later request fails at once, the install walk stops and EndSync is not sent, so
+// WiRSa does not go on talking to a Palm that has gone (pilot-link marks the socket PI_SOCK_CONN_BREAK the same way).
+static bool hsLinkDead = false;
+
+// Lost-ack repair, as pilot-link's padp_tx(): the last fragment we acked (a repeat of it means our ack was lost: ack it again), and a packet that arrived while we waited
+// for an ack but was already the reply (the Palm's ack was lost: take it as acked and keep the packet for the receiver).
+struct HsLastAck { bool valid; uint8_t tid, flags; uint16_t ofst; };
+static HsLastAck hsLastAck = { false, 0, 0, 0 };
+static bool hsPendValid = false;
+static uint8_t hsPendDst, hsPendSrc, hsPendTyp, hsPendTid;
+static uint16_t hsPendLen;
+static uint8_t hsPend[FRAG_HDR_LEN + FRAG_MAX_CHUNK_SZ];
 static char     hsCurFileName[40];
 
 // OLED status area state, see hsDrawStatus().
@@ -301,6 +316,13 @@ static void hsSlkSend(uint8_t dst, uint8_t src, uint8_t pktTyp, uint8_t tid,
 static bool hsSlkRecvOne(uint8_t *outDst, uint8_t *outSrc, uint8_t *outTyp, uint8_t *outTid,
                           uint8_t *payload, uint16_t payloadCap, uint16_t *payloadLenOut,
                           unsigned long deadlineMs) {
+  if (hsPendValid && hsPendLen <= payloadCap) {   // kept by hsFragSendChunk: the reply that came in place of an ack
+    hsPendValid = false;
+    *outDst = hsPendDst; *outSrc = hsPendSrc; *outTyp = hsPendTyp; *outTid = hsPendTid;
+    memcpy(payload, hsPend, hsPendLen);
+    *payloadLenOut = hsPendLen;
+    return true;
+  }
   uint8_t window[SLK_HDR_LEN] = {0};
   // Whether any byte arrived at all, so a timeout log can tell "nothing sent" from "something arrived but never formed a header".
   uint32_t bytesSeen = 0;
@@ -379,6 +401,7 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
   pos = hsPut8(out, pos, flags);
   pos = hsPut16(out, pos, ofstField);
   pos = hsPutBytes(out, pos, data, len);
+  if (hsLinkDead) return false;
 
   for (uint8_t attempt = 0; attempt < FRAG_MAX_RESENDS; attempt++) {
     if (attempt > 0 && logOn(LOG_VERBOSE)) {
@@ -390,8 +413,8 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
     unsigned long deadline = millis() + FRAG_ACK_WAIT_MS;
     for (;;) {
       uint8_t gDst, gSrc, gTyp, gTid;
-      // A Palm's ACK carries 2 bytes beyond the 4-byte FragHdr (a known PalmOS quirk); only the first 4 are read.
-      uint8_t rxBuf[16];
+      // A Palm's ACK carries 2 bytes beyond the 4-byte FragHdr (a known PalmOS quirk); only the first 4 are read. Room for a whole data fragment, which may be the reply.
+      static uint8_t rxBuf[FRAG_HDR_LEN + FRAG_MAX_CHUNK_SZ];
       uint16_t rxLen;
       if (!hsSlkRecvOne(&gDst, &gSrc, &gTyp, &gTid, rxBuf, sizeof(rxBuf), &rxLen, deadline))
         break;   // timed out waiting for this attempt's ack - resend
@@ -402,13 +425,36 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
       uint16_t gFragOfst = hsGet16(rxBuf, 2);
 
       // It must be addressed to us, same pktTyp and tid, an ACK. The echoed ofst/size is not compared, as in pilot-link's padp_tx(), which matches on (ACK, txid) only.
-      if (gDst != srcSlk || gSrc != dstSlk || gTyp != PKT_TYP_HOTSYNC || gTid != tid) {
+      if (gDst != srcSlk || gSrc != dstSlk || gTyp != PKT_TYP_HOTSYNC ||
+          (gTid != tid && gFragTyp != FRAG_TYP_DATA)) {
         if (logOn(LOG_VERBOSE) && (gTyp == PKT_TYP_HOTSYNC)) {
           logPrintf(LOG_VERBOSE, "HotSync: ignoring unrelated pkt dst=%u src=%u tid=%u (want tid=%u)\r\n",
                          gDst, gSrc, gTid, tid);
         }
         continue;
       }
+      if (gFragTyp == FRAG_TYP_DATA && gTyp == PKT_TYP_HOTSYNC && gDst == srcSlk) {
+        if (gTid == tid && (flags & FRAG_FLAG_LAST)) {
+          // The reply to this request, so the Palm had our last fragment and its ack was lost ("PADP TX Missing Ack"): done, and the receiver gets this packet.
+          LOGV("HotSync: ack lost, the reply came instead (tid=%u)\r\n", tid);
+          hsPendDst = gDst; hsPendSrc = gSrc; hsPendTyp = gTyp; hsPendTid = gTid; hsPendLen = rxLen;
+          memcpy(hsPend, rxBuf, rxLen);
+          hsPendValid = true;
+          return true;
+        }
+        if (hsLastAck.valid && gTid == hsLastAck.tid && gFragFlags == hsLastAck.flags && gFragOfst == hsLastAck.ofst) {
+          // A repeat of the last fragment we received: our ack was lost ("PADP TX resending lost ACK").
+          LOGV("HotSync: Palm repeated tid=%u - acking it again\r\n", gTid);
+          uint8_t ackHdr[FRAG_HDR_LEN];
+          uint16_t p = 0;
+          p = hsPut8(ackHdr, p, FRAG_TYP_ACK);
+          p = hsPut8(ackHdr, p, gFragFlags);
+          p = hsPut16(ackHdr, p, gFragOfst);
+          hsSlkSend(gSrc, gDst, gTyp, gTid, ackHdr, p);
+          continue;
+        }
+      }
+      if (gTid != tid) continue;
       if (gFragTyp != FRAG_TYP_ACK) continue;
 
       if (gFragFlags & FRAG_FLAG_OOM) {
@@ -418,10 +464,8 @@ static bool hsFragSendChunk(uint8_t dstSlk, uint8_t srcSlk, uint8_t tid,
       return true;
     }
   }
-  if (logOn(LOG_VERBOSE)) {
-    logPrintf(LOG_VERBOSE, "HotSync: no ack after %u attempts (tid=%u flags=0x%02x ofst=%u len=%u) - giving up\r\n",
-                   (unsigned) FRAG_MAX_RESENDS, tid, flags, ofstField, len);
-  }
+  LOGW("HotSync: no ack after %u tries (tid=%u) - the Palm has gone, session abandoned\r\n", (unsigned) FRAG_MAX_RESENDS, tid);
+  hsLinkDead = true;
   return false;
 }
 
@@ -495,10 +539,23 @@ static bool hsFragRecv(uint8_t *dst, uint16_t dstCap, uint16_t *lenInOut,
     const uint8_t *fragData = rawBuf + FRAG_HDR_LEN;
     uint16_t fragDataLen = rawLen - FRAG_HDR_LEN;
 
-    if (fragTyp != FRAG_TYP_DATA) continue;   // stray ACK or similar - ignore
+    if (fragTyp != FRAG_TYP_DATA) continue;   // stray ACK, or a tickle (the Palm is busy): keep waiting
 
     if (gDst != PKT_ADDR_DESKTOP_LINK || gSrc != PKT_ADDR_DESKTOP_LINK || gTyp != PKT_TYP_HOTSYNC)
       continue;   // not addressed to the hotsync desktop-link socket - ignore
+
+    // A repeat of a fragment already acked (our ack was lost): ack it again, as pilot-link does, or the Palm resends until it gives up.
+    if (hsLastAck.valid && gTid == hsLastAck.tid && fragFlags == hsLastAck.flags && fragOfst == hsLastAck.ofst &&
+        !(haveFirst && gTid == lockedTid && fragOfst == done)) {
+      uint8_t ackHdr[FRAG_HDR_LEN];
+      uint16_t p = 0;
+      p = hsPut8(ackHdr, p, FRAG_TYP_ACK);
+      p = hsPut8(ackHdr, p, fragFlags);
+      p = hsPut16(ackHdr, p, fragOfst);
+      hsSlkSend(gSrc, gDst, gTyp, gTid, ackHdr, p);
+      LOGV("HotSync: repeated fragment tid=%u - acked again\r\n", gTid);
+      continue;
+    }
 
     uint16_t nowOfst;
     if (!haveFirst) {
@@ -527,6 +584,7 @@ static bool hsFragRecv(uint8_t *dst, uint16_t dstCap, uint16_t *lenInOut,
       p = hsPut8(ackHdr, p, fragFlags);
       p = hsPut16(ackHdr, p, fragOfst);
       hsSlkSend(gSrc, gDst, gTyp, gTid, ackHdr, p);
+      hsLastAck.valid = true; hsLastAck.tid = gTid; hsLastAck.flags = fragFlags; hsLastAck.ofst = fragOfst;
     }
 
     if (fragDataLen && done + fragDataLen <= dstCap) memcpy(dst + done, fragData, fragDataLen);
@@ -559,11 +617,16 @@ static bool hsDlpTxRx(uint8_t pktTyp, const uint8_t *argData, uint16_t argLen,
   // DbClose's 1-byte arg gets a pad). Doing both here covers every call site.
   while (pos < 4 || (pos & 1)) pos = hsPut8(txBuf, pos, 0);
 
+  if (hsLinkDead) return false;
   uint8_t tid = hsNextTid();
   if (!hsFragSendOne(tid, txBuf, pos)) return false;
 
   uint16_t rxLen = sizeof(hsRxBuf);
-  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + 3000, NULL)) return false;
+  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + HS_REPLY_WAIT_MS, NULL)) {
+    LOGW("HotSync: no reply to request 0x%02x in %u s - the Palm has gone, session abandoned\r\n", pktTyp, (unsigned) (HS_REPLY_WAIT_MS / 1000));
+    hsLinkDead = true;
+    return false;
+  }
 
   if (rxLen < 4) return false;
   uint8_t rspTyp = hsRxBuf[0];
@@ -637,10 +700,12 @@ static uint32_t hsHandshake(const uint8_t *wakePayload, uint16_t wakeLen, uint32
 
   uint8_t init[10];
   uint16_t pos = 0;
+  // CMP version: the Palm's, but at most 1.2, as pilot-link's cmp_tx() (PI_CMP_VERSION); this code used to answer 1.0 to every Palm.
+  uint16_t ver = hsGet16(wakePayload, 2);
+  if (ver > 0x0102) ver = 0x0102;
   pos = hsPut8(init, pos, HS_PKT_INIT);
   pos = hsPut8(init, pos, flags);
-  pos = hsPut8(init, pos, 1);
-  pos = hsPut8(init, pos, 0);
+  pos = hsPut16(init, pos, ver);
   pos = hsPut16(init, pos, 0);
   pos = hsPut32(init, pos, curBaud);
 
@@ -658,8 +723,6 @@ static uint32_t hsHandshake(const uint8_t *wakePayload, uint16_t wakeLen, uint32
   }
 
   LOGV("HotSync: INIT acked");
-
-  if (flags & HS_INIT_FLG_CHANGE_BAUDRATE) delay(100);   // let both ends settle before switching
 
   return curBaud;
 }
@@ -755,7 +818,7 @@ static bool hsResWriteContinue(const uint8_t *data, uint16_t len) {
 }
 static bool hsResWriteFinish() {
   uint16_t rxLen = sizeof(hsRxBuf);
-  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + 5000, NULL)) return false;
+  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + HS_REPLY_WAIT_MS, NULL)) { hsLinkDead = true; return false; }
   if (rxLen < 4 || hsRxBuf[0] != (HS_PKT_REPLY_MASK | HS_PKT_RES_WRITE)) return false;
   return hsGet16(hsRxBuf, 2) == 0;
 }
@@ -784,7 +847,7 @@ static bool hsRecWriteContinue(const uint8_t *data, uint16_t len) {
 }
 static bool hsRecWriteFinish() {
   uint16_t rxLen = sizeof(hsRxBuf);
-  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + 5000, NULL)) return false;
+  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + HS_REPLY_WAIT_MS, NULL)) { hsLinkDead = true; return false; }
   if (rxLen < 4 || hsRxBuf[0] != (HS_PKT_REPLY_MASK | HS_PKT_REC_WRITE)) return false;
   return hsGet16(hsRxBuf, 2) == 0;
 }
@@ -810,7 +873,7 @@ static bool hsInfoWriteContinue(const uint8_t *data, uint16_t len) {
 }
 static bool hsInfoWriteFinish(bool appInfo) {
   uint16_t rxLen = sizeof(hsRxBuf);
-  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + 5000, NULL)) return false;
+  if (!hsFragRecv(hsRxBuf, sizeof(hsRxBuf), &rxLen, millis() + HS_REPLY_WAIT_MS, NULL)) { hsLinkDead = true; return false; }
   uint8_t want = HS_PKT_REPLY_MASK | (appInfo ? HS_PKT_APP_INFO_WRITE : HS_PKT_SORT_INFO_WRITE);
   if (rxLen < 4 || hsRxBuf[0] != want) return false;
   return hsGet16(hsRxBuf, 2) == 0;
@@ -1120,6 +1183,7 @@ static bool hsInstallExt(const char *path, const char *ext, bool deleteFirst, bo
   LOGV("HotSync: scanning %s for %s files\r\n", path, ext);
   uint16_t foundCount = 0;
   for (;;) {
+    if (hsLinkDead) { anyFail = true; break; }   // the Palm has gone: nothing more to send
     File f = dir.openNextFile();
     if (!f) break;
     if (f.isDirectory()) { f.close(); continue; }
@@ -1177,7 +1241,7 @@ static void hsInstallWalk(bool *anyFailOut) {
   // ---- INSTALL folder: general apps, always delete-then-reinstall, never forces a reset (as pilot-link's pi_file_install()). Installed files move to INSTALLED so a sync does
   // not reinstall them. ----
   hsLog("Checking INSTALL Dir");
-  if (hsFolderExists("/PALM/PROGRAMS/INSTALL")) {
+  if (!hsLinkDead && hsFolderExists("/PALM/PROGRAMS/INSTALL")) {
     hsLog("Install from INSTALL");
     if (!hsInstallExt("/PALM/PROGRAMS/INSTALL", ".PRC", true, false, NULL, "/PALM/PROGRAMS/INSTALLED")) anyFail = true;
     if (!hsInstallExt("/PALM/PROGRAMS/INSTALL", ".PDB", true, false, NULL, "/PALM/PROGRAMS/INSTALLED")) anyFail = true;
@@ -1190,13 +1254,23 @@ static void hsInstallWalk(bool *anyFailOut) {
 // cannot hang, though it blocks loop() meanwhile. ----
 
 static bool hsRunSession(const uint8_t *wakePayload, uint16_t wakeLen) {
+  hsLinkDead = false;
+  hsPendValid = false;
   uint32_t br = hsHandshake(wakePayload, wakeLen, (uint32_t) bauds[serialSpeed]);
   if (!br) {
     LOGW("HotSync: handshake failed");
     return false;  // stay in Waiting: never connected, nothing to show as Completed
   }
 
-  PhysicalSerial.begin(br, SERIAL_8N1, RXD2, TXD2);
+  if (br != PhysicalSerial.baudRate()) {
+    // As pilot-link's s_changebaud(): 200 ms, the new rate once the output has drained, 200 ms. updateBaudRate() keeps the driver and pins (begin() reinstalls the driver,
+    // which can glitch the TX line just as the Palm starts listening at the new rate).
+    PhysicalSerial.flush();
+    delay(200);
+    PhysicalSerial.updateBaudRate(br);
+    delay(200);
+    while (PhysicalSerial.available()) PhysicalSerial.read();
+  }
   hsDrawHeader();
   hsSetState("Connected");
   LOGI("HotSync: connected at %lu baud\r\n", (unsigned long) br);
@@ -1212,10 +1286,15 @@ static bool hsRunSession(const uint8_t *wakePayload, uint16_t wakeLen) {
   bool anyFail = false;
   hsInstallWalk(&anyFail);
 
-  bool endOk = hsEndSync(anyFail ? HS_END_CAUSE_OTHER : HS_END_CAUSE_NORMAL);
-  if (logOn(LOG_WARN)) {
-    logPrintf(LOG_WARN, "HotSync: EndSync %s (cause=%s)\r\n", endOk ? "acked" : "not acked/failed",
-                   anyFail ? "OTHER (install had failures)" : "NORMAL");
+  bool lost = hsLinkDead;
+  if (lost) {
+    LOGW("HotSync: the Palm stopped answering - no EndSync, back to waiting\r\n");
+  } else {
+    bool endOk = hsEndSync(anyFail ? HS_END_CAUSE_OTHER : HS_END_CAUSE_NORMAL);
+    if (logOn(LOG_WARN)) {
+      logPrintf(LOG_WARN, "HotSync: EndSync %s (cause=%s)\r\n", endOk ? "acked" : "not acked/failed",
+                     anyFail ? "OTHER (install had failures)" : "NORMAL");
+    }
   }
 
   // A DB installed with PALM_DB_ATTR_RESET makes the Palm reset itself after the sync to load the new code (standard HotSync behaviour), hence the noise on the line after
@@ -1228,8 +1307,8 @@ static bool hsRunSession(const uint8_t *wakePayload, uint16_t wakeLen) {
   while (PhysicalSerial.available()) PhysicalSerial.read();
 
   hsDrawHeader();
-  hsSetState(hsSasdInitTriggered ? "Init Complete" : "Completed");
-  hsLog("Hotsync completed");
+  hsSetState(lost ? "Palm lost" : hsSasdInitTriggered ? "Init Complete" : "Completed");
+  hsLog(lost ? "Connection lost" : "Hotsync completed");
   LOGI("HotSync: session complete - %lu installed, %lu already there%s, %lus\r\n", (unsigned long) hsInstalledCount,
        (unsigned long) hsSkippedCount, anyFail ? ", WITH ERRORS" : "", (unsigned long) ((millis() - hsSessionStartMs) / 1000));
   return true;
@@ -1244,6 +1323,9 @@ static bool hsPollForWake(uint8_t *outPayload, uint16_t *outLen) {
   uint16_t len = *outLen;
   uint8_t tid;
   unsigned long deadline = millis() + 1000;
+  // A new session: forget the last ack, or a WAKE that looks like the previous session's (same tid, flags and length) would be taken for a repeat and only acked again.
+  hsLastAck.valid = false;
+  hsPendValid = false;
   if (!hsFragRecv(outPayload, len, &len, deadline, &tid)) {
     LOGV("HotSync: gave up on this byte burst (no valid packet synced in time)");
     return false;

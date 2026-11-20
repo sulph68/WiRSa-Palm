@@ -20,6 +20,7 @@
 #include "autobaud.h"
 #include "battery.h"
 #include "sd_usage.h"
+#include "sd_format.h"
 #include "wifi_setup.h"
 #include <WiFi.h>
 #include <SD.h>
@@ -44,7 +45,7 @@ enum : uint8_t {
   CTL_PING = 0x40, CTL_STATUS = 0x41, CTL_WIFI_SCAN = 0x42, CTL_WIFI_SET = 0x43,
   CTL_CFG_GET = 0x44, CTL_CFG_SET = 0x45, CTL_SECRETS = 0x46, CTL_FTP = 0x47,
   CTL_ENTER = 0x48, CTL_EXIT = 0x49, CTL_REBOOT = 0x4A, CTL_FACTORY = 0x4B,
-  CTL_SPEED = 0x4C, CTL_LOG = 0x4D, CTL_SYSINFO = 0x4E,
+  CTL_SPEED = 0x4C, CTL_LOG = 0x4D, CTL_SYSINFO = 0x4E, CTL_FORMAT_SD = 0x4F,
   CTL_ERR = 0x5F
 };
 enum : uint8_t {
@@ -827,6 +828,34 @@ void sendSys(size_t len) {
   reply((uint8_t) (CTL_SYSINFO + 0x20), gOut, w.len);
 }
 
+// FORMAT_SD: "FORMAT" (6 bytes), copy u8. Erases the SD card (sd_format.h); with copy set, then copies the virtual card's
+// SASD install set onto it. Reply: ok u8 (1), fat u8 (16 or 32), copied u8, total u8, note str ("" or why the copy failed).
+void formatSd(size_t len) {
+  if (len < 7 || memcmp(gBody, "FORMAT", 6) != 0) { replyErr(ERR_BAD_REQUEST, "Bad FORMAT_SD"); return; }
+  bool copy = gBody[6] != 0;
+#if WIRSA_FEATURE_FTPSERVER
+  if (ftpServerRunning) { replyErr(ERR_BUSY, "Stop the FTP server first."); return; }
+#endif
+  String err;
+  uint8_t fat = 0;
+  if (!sdFormatCard(&fat, err)) {
+    gSdState = SD.cardType() != CARD_NONE ? 1 : 0;
+    replyErr(err == "No SD card" ? ERR_NO_SD : ERR_FAILED, err.c_str());
+    return;
+  }
+  gSdState = 1;
+  uint8_t copied = 0, total = 0;
+  String note;
+  if (copy && !sdCopySasdFromVirtual(&copied, &total, err)) note = err;
+  Writer w(gOut, sizeof(gOut));
+  w.u8(1);
+  w.u8(fat);
+  w.u8(copied);
+  w.u8(total);
+  w.str(note);
+  reply((uint8_t) (CTL_FORMAT_SD + 0x20), gOut, w.len);
+}
+
 // A frame read in a menu (main menu or any menu screen).
 void handleMenuFrame(uint8_t type, size_t len, bool enc) {
   if (RelayProto::handleKex(PhysicalSerial, type, gBody, len)) return;
@@ -876,6 +905,7 @@ void handleMenuFrame(uint8_t type, size_t len, bool enc) {
 #endif
     case CTL_LOG:       sendLog(len); break;
     case CTL_SYSINFO:   sendSys(len); break;
+    case CTL_FORMAT_SD: formatSd(len); changed = true; break;
     case CTL_FACTORY:
       if (len != 5 || memcmp(gBody, "RESET", 5) != 0) { replyErr(ERR_BAD_REQUEST, "Bad FACTORY_RESET"); break; }
       replyOk(CTL_FACTORY);

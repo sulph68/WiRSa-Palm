@@ -198,7 +198,7 @@ String orientationMenuDisp[] = { "Normal", "Flipped" };
 String defaultModeDisp[] = { "Main Menu", "MODEM Mode" };
 // Auto-Detect Baud, Hex Dump Mode, Loopback Test and Signal Monitor were never Utilities items, and were not reachable via AT$BAUD?/AT$HEX/AT$LOOP/AT$SIG either: that dispatcher had no callers once
 // MODEM mode's parser went. Removed in a later size cleanup (see globals.h).
-String diagnosticsMenuDisp[] = { "Main Menu", "Retry WiFi", "Information" };
+String diagnosticsMenuDisp[] = { "Main Menu", "Retry WiFi", "Information", "Format SD Card" };
 
 bool quietMode = false;        // ATQ1 suppresses result codes
 byte escChar = '+';            // ATS2 escape character (255=disabled)

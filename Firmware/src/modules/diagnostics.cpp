@@ -9,6 +9,11 @@
 #include "settings.h"
 #include "network.h"
 #include "battery.h"
+#include "sd_format.h"
+#include "sd_mount.h"
+#include "sd_usage.h"
+#include "vdisk.h"
+#include "vdfs.h"
 #include <WiFi.h>
 #include <Adafruit_SSD1306.h>
 
@@ -22,6 +27,7 @@ extern const int bauds[];
 extern HardwareSerial PhysicalSerial;
 extern String build;
 extern String ssid, password;
+extern bool ftpServerRunning;   // main.cpp
 
 extern bool BTNUP;
 extern bool BTNDN;
@@ -82,9 +88,9 @@ void hexDumpByte(char direction, uint8_t byte) {
 // ---- Information screen (Utilities menu): a HotSync/BitWarden-style boxed header and a scrollable status area, reflowed into a line list sized for the OLED's status area. ----
 
 #if defined(BATTERY_PIN)
-#define INFO_MAX_LINES 12    // + the battery line
+#define INFO_MAX_LINES 15    // + the battery line
 #else
-#define INFO_MAX_LINES 11
+#define INFO_MAX_LINES 14
 #endif
 #define INFO_VISIBLE_LINES 4  // status area is 47px tall / 10px per row
 
@@ -124,6 +130,28 @@ static void infoBuildLines() {
   infoLines[infoLineCount++] = "Baud: " + String(bauds[serialSpeed]) +
     (menuBaud() != (uint32_t) bauds[serialSpeed]   // dual-rate menu swapped (palm_ctl.h)
        ? " now " + String(menuBaud()) : String(""));   // "Baud: 115200 now 9600" = 21 chars
+
+  // The disks: which one SASD and HotSync use (Config's Disk setting), then each card's used/total in the units of
+  // WiRSaControl's SD row. The SD card's used space is counted from its FAT (sd_usage.h): give it up to 2 s here.
+  infoLines[infoLineCount++] = String("Disk: ") +
+    (sasdDiskMode == SASD_DISK_SD ? "SD card" : sasdDiskMode == SASD_DISK_VIRTUAL ? "Virtual" : "Auto");
+  bool sdUp = SD.cardType() != CARD_NONE ? sdAlive() : sdMount();
+  if (sdUp) {
+    // The count only runs at the main menu (palm_ctl.cpp), so step it here: once to pick up a change, then until done.
+    sdUsageStep();
+    for (unsigned long t0 = millis(); millis() - t0 < 2000 && sdUsageText().startsWith("?"); ) sdUsageStep();
+    String u = sdUsageText();
+    infoLines[infoLineCount++] = "SD: " + (u.length() ? u : String("present"));   // "SD: 24.016MB/921.0MB" = 20
+  } else {
+    infoLines[infoLineCount++] = "SD: Not present";
+  }
+  if (vdiskPresent()) {
+    uint64_t used = 0, total = 0;
+    bool ok = vdiskUsage(&used, &total);
+    if (!vdfsMounted()) vdiskClose();   // HotSync or the FTP server may hold it open
+    infoLines[infoLineCount++] = "V. SD: " + (ok ? sdHumanBytes(used, 1) + "/" + sdHumanBytes(total, 1)
+                                                  : String("not formatted"));   // "V. SD: 515.0KB/11.9MB" = 21
+  }
 
   // Defensive truncate: a line is ~21 chars before the default font wraps it onto the next row and breaks the fixed 10 px spacing (mainly long WiFi SSIDs).
   for (int i = 0; i < infoLineCount; i++) {
@@ -222,12 +250,82 @@ void showInformationScreen() {
   diagnosticsMenu(false);  // BACK returns to Utilities
 }
 
+// ---- Format Card (Utilities): erase the SD card or the virtual card ----
+
+// A key from the Palm line or the console (burst-guarded, as Factory Reset's confirmation), or 0 after 15 s.
+static char formatKey() {
+  unsigned long t0 = millis();
+  while (millis() - t0 < 15000) {
+    char k = 0;
+    if (menuKey(k)) { SerialPrint(k); return k; }
+    delay(10);
+  }
+  return 0;
+}
+
+// Buttons (OLED builds): wait for one of ENTER/UP/DOWN/BACK and return 'E', 'U', 'D' or 'B'.
+static char formatButton() {
+  waitSwitches();
+  while (true) {
+    readSwitches();
+    if (BTNEN) { waitSwitches(); return 'E'; }
+    if (BTNUP) { waitSwitches(); return 'U'; }
+    if (BTNDN) { waitSwitches(); return 'D'; }
+    if (BTNBK) { waitSwitches(); return 'B'; }
+    delay(50);
+  }
+}
+
+static void formatDone(const String &line, const String &screen) {
+  SerialPrintLn(line);
+  showMessage(screen);
+  delay(2500);
+}
+
+// SD card only. The virtual card is never formatted from here (or from WiRSaControl): it holds the files a blank Palm
+// is set up from (HotSync installs, the SASD set), and with no copy elsewhere they could only come back over FTP.
+static void formatCardScreen(bool byButton) {
+  if (ftpServerRunning) {   // the FTP server holds the card
+    formatDone("\r\nCannot format: the FTP server is running. Stop it first.", "Cannot format.\nStop FTP first");
+    return;
+  }
+  if (byButton) {
+    showMessage("ERASE SD CARD?\n\nENTER: Confirm\nBACK: Cancel");
+    if (formatButton() != 'E') { formatDone("\r\nFormat cancelled.", "Format\ncancelled"); return; }
+  } else {
+    SerialPrintLn("\r\nErase EVERYTHING on the SD card? Press Y to confirm, any other key to cancel.");
+    showMessage("ERASE SD CARD?\n\nY: Confirm\nOther key: Cancel");
+    char y = formatKey();
+    if (y != 'Y' && y != 'y') { formatDone("\r\nFormat cancelled.", "Format\ncancelled"); return; }
+  }
+
+  String err;
+  SerialPrintLn("\r\nFormatting the SD card...");
+  showMessage("PLEASE WAIT\n\nFormatting the\nSD card");
+  uint8_t fat = 0;
+  if (!sdFormatCard(&fat, err)) { formatDone("SD card not formatted: " + err, "Format failed\n\n" + err); return; }
+  SerialPrintLn("SD card formatted (FAT" + String(fat) + ").");
+
+  // A new card gets the SASD install set from the virtual card, so a Palm can install the driver from it.
+  SerialPrintLn("Copying the SASD install set from the virtual card...");
+  showMessage("PLEASE WAIT\n\nCopying the\nSASD files");
+  uint8_t copied = 0, total = 0;
+  if (!sdCopySasdFromVirtual(&copied, &total, err))
+    formatDone("SASD files not copied: " + err, "Formatted, FAT" + String(fat) + "\n\nSASD copy failed");
+  else if (total == 0)
+    formatDone("The virtual card has no /PALM/PROGRAMS/SASD folder: nothing copied.",
+               "Formatted, FAT" + String(fat) + "\n\nNo SASD files\nto copy");
+  else
+    formatDone("Copied " + String(copied) + " of " + String(total) + " SASD files to /PALM/PROGRAMS/SASD.",
+               "Formatted, FAT" + String(fat) + "\n\nSASD files:\n" + String(copied) + " of " + String(total) + " copied");
+}
+
 // ---- Diagnostics menu and loop ----
 
 void diagnosticsMenu(bool arrow) {
   menuMode = MODE_DIAGNOSTICS;
   // The internal menu name stays "DIAG" (it drives the serial "-=-=- DIAG MENU -=-=-" banner); the header shows "Utilities" to match the main-menu item that leads here and to free room for the WiFi icon.
-  showMenu("DIAG", diagnosticsMenuDisp, 3, (arrow ? MENU_DISP : MENU_BOTH), 0, false, "Utilities");
+  showMenu("DIAG", diagnosticsMenuDisp, 4, (arrow ? MENU_DISP : MENU_BOTH), 0, false, "Utilities");
 }
 
 void diagnosticsLoop() {
@@ -294,6 +392,11 @@ void diagnosticsLoop() {
     else if (chr == 'I' || chr == 'i' || menuSel == 2) {
       // Information: its own scrollable screen, which handles its BACK to Utilities itself (see showInformationScreen()).
       showInformationScreen();
+    }
+    else if (chr == 'F' || chr == 'f' || menuSel == 3) {
+      formatCardScreen(menuSel == 3);
+      lastMenu = -1;   // the messages drew over the menu: redraw it in full
+      diagnosticsMenu(false);
     }
     else if (serAvl > 0) {
       diagnosticsMenu(false);

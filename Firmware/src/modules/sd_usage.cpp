@@ -82,6 +82,12 @@ void sdUsageActivity() {
   gDirty = true;
 }
 
+void sdUsageReset() {
+  gState = S_IDLE;
+  gHaveTotal = false;
+  gDirty = false;
+}
+
 void sdUsageStep() {
   if (SD.cardType() == CARD_NONE) { gState = S_IDLE; gHaveTotal = false; gDirty = false; return; }
 
